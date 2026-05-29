@@ -1,0 +1,12 @@
+# Local credentials and tokens
+agent/auth.json
+agent/spotify-token.json
+**/.env
+**/*.key
+**/*.pem
+
+# Pi session transcripts / local runtime state
+agent/sessions/
+
+# Local helper binaries/caches
+agent/bin/
