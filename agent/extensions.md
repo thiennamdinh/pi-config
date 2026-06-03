@@ -44,3 +44,109 @@ Candidate agents:
 - `tester` — focused verification/failure-analysis agent. Runs or designs tests, reproduces failures, inspects logs, and recommends minimal fixes. Distinct from `reviewer`: reviewer critiques code; tester exercises behavior.
 
 Initial preference: keep subagents read-only where possible. Let the main Pi decide which recommendations to act on and perform edits unless a task is very isolated.
+
+## 4. Fire-and-Forget / Topic Sidecars
+
+Higher priority than full subagents for low-context recurring domains.
+
+Goals:
+
+- Avoid blocking/cluttering the main Pi session for small side effects.
+- Run occasional one-off commands in isolated topic contexts with only the relevant tools/memory.
+- Keep outputs minimal unless explicitly requested.
+
+Candidate topic sidecars:
+
+- `music` — Spotify tools + `music.md`; examples: play, pause, queue, remember music preferences.
+- `pi-ext` — Pi config/extensions/tmux tweaks; knows Pi docs paths, `~/.pi/agent/`, and `~/.emacs.d/.tmux.conf`.
+- `notes` — capture ideas, summarize sessions, append to a chosen notes inbox once a notes location is decided.
+
+Possible command shape:
+
+```text
+/topic music "play upbeat electronic"
+/topic pi-ext "prototype async spotify pause"
+/topic notes "summarize this session into my inbox"
+```
+
+Implementation idea: spawn `pi -p --session-id topic-<name>` with topic-specific tools, prompt prefix, memory files, and short timeout. For Spotify specifically, also consider direct `spotify_*_async` tools that return immediately and log errors separately.
+
+## 5. Long-Running Background Agents
+
+Explore separately from fire-and-forget side effects and synchronous subagents.
+
+Use case: spin up bounded-but-long tasks that may run for minutes/hours without occupying the main chat, such as:
+
+- one-shotting inconsequential apps/prototypes
+- deep web research with source collection
+- large codebase reconnaissance
+- batch data cleanup/classification
+- long debugging or reproduction attempts
+
+Possible model:
+
+```text
+/background start research "investigate X and write findings to ..."
+/background status
+/background attach <job>
+/background stop <job>
+```
+
+Implementation ideas:
+
+- Spawn separate Pi processes in tmux/vterm or as detached subprocesses.
+- Require each job to write artifacts to a job directory, e.g. `~/.pi/agent/jobs/<id>/`.
+- Keep bus/status/log files separate from main context; main Pi only reads summaries on demand.
+- Use explicit tool/model/time/resource limits per job.
+- Prefer bounded jobs with clear deliverables over indefinite autonomous agents.
+
+## 6. Global / Named Session Ergonomics
+
+Explore a lightweight layer above Pi's existing session tree/session-file model.
+
+Motivation:
+
+- Current `/resume` behavior is cwd/project-scoped, but sessions already carry cwd and Pi can switch runtimes via `ctx.switchSession()`.
+- Build a global session picker that searches all session dirs and switches to the selected session without restarting Pi, restoring that session's cwd/project context.
+- Make sessions feel more like named buffers.
+
+Possible commands:
+
+```text
+/global-resume          # pick from all sessions across cwd dirs
+/buffers                # alias with Emacs-like framing
+/new-named <name>       # create a new session and immediately name it
+/fork-named <name>      # fork and name the resulting session
+/clone-named <name>     # clone active branch and name result
+/rename <name>          # friendlier alias for /name
+```
+
+Implementation notes:
+
+- Use `SessionManager.listAll()` to discover sessions globally.
+- Use `ctx.switchSession(sessionPath)` for in-process runtime replacement.
+- Display name, cwd, modified time, and session id in the picker.
+- Preserve Pi's existing tree semantics; this is only a more global/named navigation layer.
+- This may become the foundation for higher-level named agent workspaces.
+
+## 7. Speculative Emacs/vterm Pi Sessions
+
+Explore Emacs as a buffer manager for named Pi sessions now that `vterm` works well.
+
+Potential model:
+
+```text
+*pi:main*
+*pi:music*
+*pi:news*
+*pi:pi-ext*
+```
+
+Each vterm buffer runs its own Pi process/session, e.g. `pi --session-id topic-music`, while Emacs provides native buffer/window switching. Keep current tmux flow unchanged while testing.
+
+Questions to explore:
+
+- Whether vterm handles Pi TUI/cursor/keybindings well enough long term.
+- How to balance Emacs keybindings vs raw terminal input.
+- Whether Emacs should host Pi buffers directly or just launch/switch tmux Pi panes.
+- Whether named Pi sessions can feel like Emacs buffers without adding too much process-management complexity.
