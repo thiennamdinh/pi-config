@@ -4,5 +4,6 @@
   "defaultModel": "gpt-5.5",
   "defaultThinkingLevel": "medium",
   "showHardwareCursor": true,
-  "quietStartup": true
+  "quietStartup": true,
+  "transport": "sse"
 }
