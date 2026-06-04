@@ -5,8 +5,9 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
-const TOKEN_PATH = `${process.env.HOME ?? "."}/.pi/agent/spotify-token.json`;
-const MUSIC_MEMORY_PATH = `${process.env.HOME ?? "."}/.pi/agent/memory/music.md`;
+const HOME = process.env.HOME ?? ".";
+const TOKEN_PATH = `${HOME}/.pi/agent/spotify-token.json`;
+const MUSIC_MEMORY_PATH = `${HOME}/.pi/agent/memory/music.md`;
 const DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback";
 const SCOPES = [
   "user-read-playback-state",
@@ -35,12 +36,38 @@ type SpotifyItem = {
   description?: string;
 };
 
-function getClientConfig() {
-  const clientId = process.env.SPOTIFY_CLIENT_ID;
-  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
-  const redirectUri = process.env.SPOTIFY_REDIRECT_URI ?? DEFAULT_REDIRECT_URI;
+function parseShellExport(text: string, key: string) {
+  const pattern = new RegExp(`^(?:export\\s+)?${key}=([\\s\\S]*)$`);
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = pattern.exec(line);
+    if (!match) continue;
+    let value = match[1].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    return value;
+  }
+  return undefined;
+}
+
+async function getConfigValue(key: string) {
+  if (process.env[key]) return process.env[key];
+  for (const path of [`${HOME}/.profile`, `${HOME}/.bash_profile`, `${HOME}/.bashrc`]) {
+    if (!existsSync(path)) continue;
+    const value = parseShellExport(await readFile(path, "utf8"), key);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+async function getClientConfig() {
+  const clientId = await getConfigValue("SPOTIFY_CLIENT_ID");
+  const clientSecret = await getConfigValue("SPOTIFY_CLIENT_SECRET");
+  const redirectUri = await getConfigValue("SPOTIFY_REDIRECT_URI") ?? DEFAULT_REDIRECT_URI;
   if (!clientId || !clientSecret) {
-    throw new Error("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET must be set in the pi process environment.");
+    throw new Error("Spotify client credentials are missing. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in the pi process environment or shell profile.");
   }
   return { clientId, clientSecret, redirectUri };
 }
@@ -61,7 +88,7 @@ async function saveToken(token: TokenFile) {
 }
 
 async function exchangeCode(code: string): Promise<TokenFile> {
-  const { clientId, clientSecret, redirectUri } = getClientConfig();
+  const { clientId, clientSecret, redirectUri } = await getClientConfig();
   const response = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: {
@@ -94,7 +121,7 @@ async function getAccessToken(): Promise<string> {
   }
   if (token.access_token && Date.now() < token.expires_at) return token.access_token;
 
-  const { clientId, clientSecret } = getClientConfig();
+  const { clientId, clientSecret } = await getClientConfig();
   const response = await fetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: {
@@ -152,7 +179,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("spotify-auth-url", {
     description: "Print the Spotify authorization URL for first-time setup",
     handler: async (_args, ctx) => {
-      const { clientId, redirectUri } = getClientConfig();
+      const { clientId, redirectUri } = await getClientConfig();
       const url = new URL("https://accounts.spotify.com/authorize");
       url.searchParams.set("client_id", clientId);
       url.searchParams.set("response_type", "code");
@@ -182,7 +209,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Check Spotify authorization status.",
     parameters: Type.Object({}),
     async execute() {
-      const hasClient = Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+      const hasClient = Boolean(await getConfigValue("SPOTIFY_CLIENT_ID") && await getConfigValue("SPOTIFY_CLIENT_SECRET"));
       const token = await readToken();
       const hasRefreshToken = Boolean(token?.refresh_token || process.env.SPOTIFY_REFRESH_TOKEN_PI || process.env.SPOTIFY_REFRESH_TOKEN);
       return {
