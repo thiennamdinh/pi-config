@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: pi-agent <agent> [pi args...]
+
+Runs pi against an existing persistent agent workspace under ~/.pi/agents/<agent>.
+Examples:
+  pi-agent inquirer
+  pi-agent inquirer -p "summarize queued messages"
+EOF
+}
+
+if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
+  exit $([[ $# -lt 1 ]] && echo 2 || echo 0)
+fi
+
+name="$1"
+shift
+
+if [[ ! "$name" =~ ^[a-z][a-z0-9-]{0,62}$ || "$name" == *--* || "$name" == *- ]]; then
+  echo "Invalid agent name: $name" >&2
+  exit 2
+fi
+
+agent_dir="${HOME}/.pi/agents/${name}"
+manifest="${agent_dir}/manifest.json"
+
+if [[ ! -f "$manifest" ]]; then
+  echo "Unknown agent: $name" >&2
+  echo "Create it interactively with: /agent-new $name" >&2
+  exit 1
+fi
+
+python_bin="${PYTHON:-python3}"
+session_file="$($python_bin - "$manifest" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(data.get('sessionFile') or '')
+PY
+)"
+
+if [[ -z "$session_file" || ! -f "$session_file" ]]; then
+  echo "Agent $name has no valid sessionFile in manifest.json" >&2
+  exit 1
+fi
+
+cd "$agent_dir"
+exec pi --session "$session_file" --session-dir "$agent_dir/session" "$@"
