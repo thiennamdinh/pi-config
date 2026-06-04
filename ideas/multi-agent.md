@@ -144,6 +144,8 @@ Potential message fields:
 
 Separate from agent-to-agent communication, support direct user tasking of another agent without requiring the current agent/session to know about it.
 
+Status: defer run-now cross-agent communication until IPC can be implemented completely. Avoid relying on inter-agent comms for now.
+
 Use two explicit commands rather than configurable dispatch behavior:
 
 ```text
@@ -163,8 +165,35 @@ Semantics:
 
 - `agent-task` is user-originated enqueue-only work. It does not wake/run the target agent.
 - `agent-execute` is user-originated run-now work. It sends the message to the target agent, blocks while it processes, and returns only when the target agent is done.
+- If the target agent is already open in another interactive Pi process, `agent-execute` must not start a second runtime on the same session. It should use a live-agent IPC path or refuse.
 - Neither command needs to enter or clutter the current agent conversation.
 - Useful for sidecar/controller agents like `music-controller`, where the desired effect should happen without derailing the current session.
+
+## Live-agent IPC design (deferred)
+
+Problem: Pi does not expose a built-in way for one process to poke an already-running interactive Pi session and trigger a new prompt loop. Extensions can call `pi.sendUserMessage()` inside their own process, and RPC mode can control a headless process it owns, but there is no native `pi --send-to-session <id>` equivalent.
+
+Desired solution: small per-agent IPC listener owned by the already-running interactive agent process. This preserves the current direct-chat UX and avoids daemon/client rearchitecture.
+
+Mechanics:
+
+- When a persistent agent starts interactively, `agent-workspaces.ts` creates a local Unix socket, e.g. `~/.pi/agents/<name>/ipc.sock`.
+- The agent lock/owner file records `pid`, `sessionFile`, `cwd`, and `socketPath`.
+- Other Pi processes inspect the lock before run-now operations.
+- If the target agent has a live socket, the caller sends a JSON request to that socket instead of opening the session itself.
+- The owning process receives the request and calls `pi.sendUserMessage(...)` in the live agent process.
+- If the target agent has no live owner/socket, the caller may run/switch locally as today.
+- `agent-task` remains enqueue-only and can keep appending to `messages.jsonl` without waking the agent.
+
+Response semantics must be implemented all-or-nothing, not as a half-delivery MVP:
+
+- `agent-execute`, `agent-tell`, and `agent-ask` should block until the target agent finishes processing the injected request.
+- The owner should serialize remote requests per agent so responses can be correlated reliably.
+- The IPC protocol should assign request ids, send `accepted`, stream or summarize progress if useful, and return final status plus final assistant text.
+- The owner must handle idle/running cases, queued follow-up delivery, aborts/errors, client disconnects, and stale locks/sockets.
+- Do not implement a fire-and-forget run-now mode that merely says “delivered”; it would make behavior too ambiguous.
+
+Long-term alternative rejected for now: per-agent or global `pi --mode rpc` daemons with frontends as clients. This could work technically, but it would significantly change Pi's feel: the frontend would become a controller/view while the daemon owns the canonical session. Prefer preserving the current interactive session UX.
 
 ## Built-in session command guardrails
 
@@ -266,8 +295,8 @@ This is acceptable even if the active experience is not perfectly linear, becaus
 2. Define the agent workspace layout and manifest schema.
 3. Build `/agent-list`, `/agent-new <name>`, and `/agent-switch <name>` using in-process session switching.
 4. Add clone/rename/delete lifecycle commands for the current agent, including special handling for ephemeral `pi`.
-5. Add JSONL communication with `/agent-tell`, `/agent-ask`, `/agent-task`, and `/agent-execute`.
-6. Add blocking, interruptible multi-round behavior for `/agent-ask` and `/agent-execute`.
+5. Add JSONL communication with `/agent-task` first; defer run-now inter-agent comms until live-agent IPC is complete.
+6. Add complete blocking live-agent IPC for `/agent-tell`, `/agent-ask`, and `/agent-execute`.
 7. Add non-interactive wrapper support for targeting an agent.
 8. Add rollback/audit-history navigation using Pi's existing session tree behavior.
 

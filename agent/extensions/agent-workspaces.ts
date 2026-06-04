@@ -156,6 +156,27 @@ async function forceWriteSession(manager: SessionManager) {
   await writeFile(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }
 
+async function rewriteSessionWorkspace(sessionFile: string, name: string) {
+  const cwd = agentDir(name);
+  const lines = (await readFile(sessionFile, "utf8")).split("\n").filter((line) => line.trim());
+  const entries = lines.map((line) => JSON.parse(line));
+  let sawSessionInfo = false;
+  for (const entry of entries) {
+    if (entry.type === "session") entry.cwd = cwd;
+    if (entry.type === "session_info") {
+      entry.name = name;
+      sawSessionInfo = true;
+    }
+  }
+  if (!sawSessionInfo) {
+    const manager = SessionManager.open(sessionFile, sessionDir(name), cwd);
+    manager.appendSessionInfo(name);
+    await forceWriteSession(manager);
+    return;
+  }
+  await writeFile(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+}
+
 async function createAgentWorkspace(name: string, description = "") {
   name = sanitizeName(name);
   const dir = agentDir(name);
@@ -497,7 +518,10 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       await rename(agentDir(source), agentDir(newName));
       const manifest = await readManifest(newName);
       manifest.name = newName;
-      if (manifest.sessionFile) manifest.sessionFile = manifest.sessionFile.replace(agentDir(source), agentDir(newName));
+      if (manifest.sessionFile) {
+        manifest.sessionFile = manifest.sessionFile.replace(agentDir(source), agentDir(newName));
+        await rewriteSessionWorkspace(manifest.sessionFile, newName);
+      }
       await writeJson(manifestPath(newName), manifest);
       await switchToAgent(pi, newName, ctx, `Renamed ${source} to ${newName}`);
     },
