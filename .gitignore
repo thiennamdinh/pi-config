@@ -8,5 +8,6 @@ agent/spotify-token.json
 # Pi session transcripts / local runtime state
 agent/sessions/
 agent/rate-limits.json
+agents/
 # Local helper binaries/caches
 agent/bin/

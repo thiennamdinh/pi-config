@@ -142,14 +142,17 @@ function formatMinutes(minutes: number) {
 
 function formatReset(resetAtSeconds: number) {
   const ms = resetAtSeconds * 1000;
+  const date = new Date(ms);
   const deltaMs = ms - Date.now();
-  if (!Number.isFinite(deltaMs)) return new Date(ms).toLocaleString();
-  if (deltaMs <= 0) return `past (${formatAge(ms)})`;
-  const minutes = Math.ceil(deltaMs / 60_000);
-  if (minutes < 60) return `in ${minutes}m`;
-  const hours = Math.ceil(minutes / 60);
-  if (hours < 48) return `in ${hours}h`;
-  return `in ${Math.ceil(hours / 24)}d`;
+  const time = date.toLocaleString(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+  if (!Number.isFinite(deltaMs)) return date.toLocaleString();
+  if (deltaMs <= 0) return `${time} (past, ${formatAge(ms)})`;
+  return time;
 }
 
 function formatAge(timestampMs: number) {
