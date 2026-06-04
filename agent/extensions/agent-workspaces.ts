@@ -9,8 +9,11 @@ import { dirname, join, resolve } from "node:path";
 const HOME = process.env.HOME ?? ".";
 const AGENTS_ROOT = join(HOME, ".pi", "agents");
 const TRASH_ROOT = join(AGENTS_ROOT, ".trash");
+const EPHEMERAL_PI_SESSION_DIR = join(HOME, ".pi", "agent", "tmp", "pi-ephemeral-sessions");
 const EXT_CUSTOM_TYPE = "agent-workspaces";
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
+
+let allowNextManagedSwitchToPi = false;
 
 type Manifest = {
   name: string;
@@ -40,13 +43,22 @@ type AgentMessage = {
 let activeAgent: string | null = null;
 let activeLockPath: string | null = null;
 
-function sanitizeName(name: string) {
+function validateAgentName(name: string, options: { allowPi?: boolean } = {}) {
   const trimmed = name.trim();
   if (!/^[a-z][a-z0-9-]{0,62}$/.test(trimmed) || trimmed.includes("--") || trimmed.endsWith("-")) {
     throw new Error("Agent names must be lowercase kebab-case, start with a letter, and be 1-63 chars.");
   }
-  if (trimmed === ".trash" || trimmed === "pi") throw new Error(`Reserved agent name: ${trimmed}`);
+  if (trimmed === ".trash") throw new Error(`Reserved agent name: ${trimmed}`);
+  if (trimmed === "pi" && !options.allowPi) throw new Error("Reserved agent name: pi");
   return trimmed;
+}
+
+function sanitizeName(name: string) {
+  return validateAgentName(name);
+}
+
+function sanitizeTargetName(name: string) {
+  return validateAgentName(name, { allowPi: true });
 }
 
 function agentDir(name: string) {
@@ -96,6 +108,10 @@ async function listAgents() {
     if (await exists(manifestPath(name))) out.push(name);
   }
   return out.sort();
+}
+
+async function listAgentTargets() {
+  return ["pi", ...(await listAgents())];
 }
 
 function currentAgentFromCwd(cwd: string) {
@@ -182,8 +198,35 @@ async function ensureAgentSession(name: string) {
   return sessionFile;
 }
 
+async function createEphemeralPiSession() {
+  await mkdir(EPHEMERAL_PI_SESSION_DIR, { recursive: true });
+  const manager = SessionManager.create(HOME, EPHEMERAL_PI_SESSION_DIR);
+  manager.appendSessionInfo("pi");
+  await forceWriteSession(manager);
+  const sessionFile = manager.getSessionFile();
+  if (!sessionFile) throw new Error("Could not create ephemeral pi session file.");
+  return sessionFile;
+}
+
+async function switchToPi(ctx: ExtensionCommandContext, note?: string, runPrompt?: string) {
+  const sessionFile = await createEphemeralPiSession();
+  await ctx.waitForIdle();
+  allowNextManagedSwitchToPi = true;
+  await ctx.switchSession(sessionFile, {
+    withSession: async (next: ReplacedSessionContext) => {
+      next.ui.notify(note ?? "Switched to ephemeral agent pi", "info");
+      next.ui.setStatus?.("agent-workspace", "agent:pi");
+      if (runPrompt) {
+        await next.sendUserMessage(runPrompt);
+        await next.waitForIdle();
+      }
+    },
+  });
+}
+
 async function switchToAgent(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext, note?: string, runPrompt?: string) {
-  name = sanitizeName(name);
+  name = sanitizeTargetName(name);
+  if (name === "pi") return switchToPi(ctx, note, runPrompt);
   const sessionFile = await ensureAgentSession(name);
   await ctx.waitForIdle();
   await ctx.switchSession(sessionFile, {
@@ -212,8 +255,7 @@ async function applyManifest(pi: ExtensionAPI, name: string, ctx: { modelRegistr
 }
 
 async function appendAgentMessage(to: string, message: Omit<AgentMessage, "id" | "to" | "createdAt" | "status"> & { status?: AgentMessage["status"] }) {
-  to = sanitizeName(to);
-  if (!(await exists(manifestPath(to)))) throw new Error(`Unknown agent: ${to}`);
+  to = sanitizeTargetName(to);
   const full: AgentMessage = {
     id: makeId("msg"),
     to,
@@ -221,6 +263,8 @@ async function appendAgentMessage(to: string, message: Omit<AgentMessage, "id" |
     status: message.status ?? "queued",
     ...message,
   };
+  if (to === "pi") return full;
+  if (!(await exists(manifestPath(to)))) throw new Error(`Unknown agent: ${to}`);
   await appendFile(messagesPath(to), `${JSON.stringify(full)}\n`);
   return full;
 }
@@ -342,6 +386,10 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("session_before_switch", async (event, ctx) => {
     const name = currentAgentFromCwd(ctx.cwd);
     if (!name) return;
+    if (allowNextManagedSwitchToPi) {
+      allowNextManagedSwitchToPi = false;
+      return;
+    }
     if (!event.targetSessionFile) return { cancel: true };
     const target = resolve(event.targetSessionFile);
     const root = resolve(AGENTS_ROOT);
@@ -374,7 +422,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const agents = await listAgents();
       const current = await currentAgent(ctx);
-      ctx.ui.notify([`Current agent: ${current}`, agents.length ? `Agents:\n${agents.map((a) => `- ${a}${a === current ? " (current)" : ""}`).join("\n")}` : "No persistent agents yet."].join("\n\n"), "info");
+      ctx.ui.notify([`Current agent: ${current}`, `Agents:\n- pi${current === "pi" ? " (current)" : ""}${agents.length ? `\n${agents.map((a) => `- ${a}${a === current ? " (current)" : ""}`).join("\n")}` : ""}`].join("\n\n"), "info");
     },
   });
 
@@ -389,8 +437,8 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-switch", {
-    description: "Switch to a persistent named agent",
-    getArgumentCompletions: async (prefix) => (await listAgents()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    description: "Switch to a named agent, including ephemeral pi",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const name = args.trim();
       if (!name) return usage(ctx, "Usage: /agent-switch <name>");
@@ -472,12 +520,16 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.registerCommand("agent-task", {
     description: "Append a queued user task to another agent without running it",
-    getArgumentCompletions: async (prefix) => (await listAgents()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();
       if (!to || !body) return usage(ctx, "Usage: /agent-task <agent> <message>");
       const from = await currentAgent(ctx);
+      if (to === "pi") {
+        ctx.ui.notify("Ephemeral pi has no durable task queue; use /agent-execute pi <message> to run now.", "warning");
+        return;
+      }
       const msg = await appendAgentMessage(to, { type: "task", from, body });
       ctx.ui.notify(`Queued task ${msg.id} for ${to}`, "info");
     },
@@ -485,7 +537,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.registerCommand("agent-tell", {
     description: "Send a blocking tell message to another agent",
-    getArgumentCompletions: async (prefix) => (await listAgents()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();
@@ -498,7 +550,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.registerCommand("agent-ask", {
     description: "Ask another agent a question",
-    getArgumentCompletions: async (prefix) => (await listAgents()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();
@@ -511,7 +563,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.registerCommand("agent-execute", {
     description: "Run-now task for another agent",
-    getArgumentCompletions: async (prefix) => (await listAgents()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();

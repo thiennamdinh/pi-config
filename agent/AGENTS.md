@@ -19,6 +19,11 @@ User context:
 - Location/timezone: Seattle, Pacific Time.
 - Occupation/context: computer science / cybersecurity R&D.
 
+Agent structure:
+- Persistent named agents live under `~/.pi/agents/<name>/` with local `AGENTS.md`, memory, skills, messages, manifest, and one durable session.
+- Normal root Pi sessions are ephemeral agent `pi`; clone/create a named agent for durable work.
+- Agents may and should update their own `AGENTS.md` when they learn durable operating instructions or role details.
+
 Local environment notes:
 - This is a Fedora Wayland desktop running Sway, not a headless server; terminal/tmux is the preferred workflow.
 - For clipboard operations, prefer `wl-copy` and `wl-paste`; do not use `xclip` unless explicitly requested or debugging X11/XWayland.
