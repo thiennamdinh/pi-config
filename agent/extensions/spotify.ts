@@ -175,6 +175,26 @@ async function searchSpotify(query: string, type: "track" | "album" | "artist" |
   return (data?.[key]?.items ?? []).filter(Boolean) as SpotifyItem[];
 }
 
+function playlistIdFromUriOrUrl(value: string) {
+  if (value.startsWith("spotify:playlist:")) return value.split(":")[2];
+  const match = /open\.spotify\.com\/playlist\/([^?/#]+)/.exec(value);
+  return match?.[1] ?? value;
+}
+
+function summarizePlaylist(playlist: any, index: number) {
+  const owner = playlist.owner?.display_name ? ` — by ${playlist.owner.display_name}` : "";
+  const total = typeof playlist.tracks?.total === "number" ? ` — ${playlist.tracks.total} tracks` : "";
+  return `${index + 1}. ${playlist.name}${owner}${total}\n${playlist.uri}\n${playlist.external_urls?.spotify ?? ""}${playlist.description ? `\n${playlist.description}` : ""}`;
+}
+
+function summarizePlaylistTrack(item: any, index: number) {
+  const track = item.track;
+  if (!track) return `${index + 1}. <unavailable track>`;
+  const artists = track.artists?.map((a: any) => a.name).join(", ");
+  const album = track.album?.name ? ` — ${track.album.name}` : "";
+  return `${index + 1}. ${track.name}${artists ? ` — ${artists}` : ""}${album}\n${track.uri}\n${track.external_urls?.spotify ?? ""}`;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spotify-auth-url", {
     description: "Print the Spotify authorization URL for first-time setup",
@@ -231,6 +251,52 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: devices.length ? devices.map((d: any) => `${d.name} (${d.type}) id=${d.id} active=${d.is_active}`).join("\n") : "No Spotify devices found. Open Spotify on a device first." }],
         details: { devices },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_playlists",
+    label: "Spotify Playlists",
+    description: "List the current user's Spotify playlists.",
+    promptSnippet: "List the user's Spotify playlists.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Number({ description: "Number of playlists to return, max 50." })),
+      offset: Type.Optional(Type.Number({ description: "Playlist offset for pagination." })),
+    }),
+    async execute(_id, params) {
+      const limit = Math.max(1, Math.min(50, Math.floor(params.limit ?? 20)));
+      const offset = Math.max(0, Math.floor(params.offset ?? 0));
+      const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+      const data = await spotifyApi(`/me/playlists?${qs}`) as any;
+      const playlists = (data.items ?? []).filter(Boolean);
+      return {
+        content: [{ type: "text", text: playlists.length ? playlists.map(summarizePlaylist).join("\n\n") : "No Spotify playlists found." }],
+        details: { playlists, total: data.total, limit, offset, next: data.next, previous: data.previous },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_playlist_tracks",
+    label: "Spotify Playlist Tracks",
+    description: "List tracks in a Spotify playlist by playlist URI, URL, or ID.",
+    promptSnippet: "List tracks in a Spotify playlist.",
+    parameters: Type.Object({
+      playlist: Type.String({ description: "Spotify playlist URI, URL, or ID." }),
+      limit: Type.Optional(Type.Number({ description: "Number of tracks to return, max 50." })),
+      offset: Type.Optional(Type.Number({ description: "Track offset for pagination." })),
+    }),
+    async execute(_id, params) {
+      const playlistId = playlistIdFromUriOrUrl(params.playlist);
+      const limit = Math.max(1, Math.min(50, Math.floor(params.limit ?? 25)));
+      const offset = Math.max(0, Math.floor(params.offset ?? 0));
+      const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+      const data = await spotifyApi(`/playlists/${encodeURIComponent(playlistId)}/tracks?${qs}`) as any;
+      const items = (data.items ?? []).filter(Boolean);
+      return {
+        content: [{ type: "text", text: items.length ? items.map(summarizePlaylistTrack).join("\n\n") : "No playlist tracks found." }],
+        details: { playlistId, items, total: data.total, limit, offset, next: data.next, previous: data.previous },
       };
     },
   });
