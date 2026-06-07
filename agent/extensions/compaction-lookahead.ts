@@ -35,6 +35,17 @@ const CUSTOM_DETAILS = { source: "compaction-lookahead", version: 1 };
 const BOOTSTRAP_MARGIN_TOKENS = 12000;
 const MIN_BOOTSTRAP_TOKENS_TO_SUMMARIZE = 8000;
 const READY_STATUS_MS = 45_000;
+const DURABLE_SUMMARY_INSTRUCTIONS = `Produce a durable named-agent memory checkpoint, not a terse chat recap.
+
+Favor fidelity over brevity when information may matter in future sessions. Preserve:
+- user preferences, operating constraints, and durable decisions;
+- agent identity/role, current mission, and long-running architecture direction;
+- exact paths, commands, commit hashes, settings values, error messages, and unresolved risks;
+- why important choices were made, not just what changed;
+- current repo/worktree state, open tasks, blocked transitions, and next verification steps;
+- useful local environment quirks and workflow notes.
+
+Keep the structure clear and scannable, but do not aggressively compress important old context merely to be concise. Remove obsolete noise and transient tool chatter.`;
 
 const inFlight = new Set<string>();
 
@@ -189,7 +200,7 @@ async function computeLookaheadThroughEntry(
       apiKey,
       headers,
       undefined,
-      "Produce the next lookahead compaction summary. Preserve all durable decisions, constraints, current state, open tasks, and file context needed after the retained raw window is dropped.",
+      DURABLE_SUMMARY_INSTRUCTIONS,
       undefined,
       thinkingLevel,
     );
@@ -243,7 +254,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       model,
       apiKey,
       headers,
-      "Prepare a cached first compaction summary. Preserve all durable decisions, constraints, current state, open tasks, and file context.",
+      DURABLE_SUMMARY_INSTRUCTIONS,
       undefined,
       thinkingLevel,
     );
