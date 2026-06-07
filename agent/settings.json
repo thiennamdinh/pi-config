@@ -5,5 +5,9 @@
   "defaultThinkingLevel": "medium",
   "showHardwareCursor": true,
   "quietStartup": true,
-  "transport": "sse"
+  "transport": "sse",
+  "compaction": {
+    "reserveTokens": 68000,
+    "keepRecentTokens": 115000
+  }
 }
