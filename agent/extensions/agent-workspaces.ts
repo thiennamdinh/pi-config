@@ -551,7 +551,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       if (!to || !body) return usage(ctx, "Usage: /agent-task <agent> <message>");
       const from = await currentAgent(ctx);
       if (to === "pi") {
-        ctx.ui.notify("Ephemeral pi has no durable task queue; use /agent-execute pi <message> to run now.", "warning");
+        ctx.ui.notify("Ephemeral pi has no durable task queue; run the task in the current ephemeral session or clone it into a named agent.", "warning");
         return;
       }
       const msg = await appendAgentMessage(to, { type: "task", from, body });
@@ -560,41 +560,35 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-tell", {
-    description: "Send a blocking tell message to another agent",
+    description: "Append an inbox message for another agent without running it",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();
       if (!to || !body) return usage(ctx, "Usage: /agent-tell <agent> <message>");
+      if (to === "pi") return usage(ctx, "Ephemeral pi has no durable inbox.");
       const from = await currentAgent(ctx);
-      const msg = await appendAgentMessage(to, { type: "tell", from, body, status: "processing" });
-      await switchToAgent(pi, to, ctx, `Tell from ${from} (${msg.id})`, `Process this agent-tell message. Metadata: ${JSON.stringify(msg)}\n\nBody:\n${body}`);
+      const msg = await appendAgentMessage(to, { type: "tell", from, body, status: "queued" });
+      ctx.ui.notify(`Queued tell ${msg.id} for ${to}.`, "info");
     },
   });
 
   pi.registerCommand("agent-ask", {
-    description: "Ask another agent a question",
+    description: "Ask another agent via an ephemeral read-only clone (not implemented yet)",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const [to, ...bodyParts] = args.trim().split(/\s+/);
       const body = bodyParts.join(" ").trim();
       if (!to || !body) return usage(ctx, "Usage: /agent-ask <agent> <question>");
-      const from = await currentAgent(ctx);
-      const msg = await appendAgentMessage(to, { type: "ask", from, body, status: "processing" });
-      await switchToAgent(pi, to, ctx, `Ask from ${from} (${msg.id})`, `Answer this agent-ask message. Metadata: ${JSON.stringify(msg)}\n\nQuestion:\n${body}`);
+      ctx.ui.notify("/agent-ask clone consultations are planned but not implemented yet. The old live-session switch path is disabled because it can crash Pi.", "warning");
     },
   });
 
   pi.registerCommand("agent-execute", {
-    description: "Run-now task for another agent",
+    description: "Deprecated live run-now command (disabled until live IPC exists)",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (args, ctx) => {
-      const [to, ...bodyParts] = args.trim().split(/\s+/);
-      const body = bodyParts.join(" ").trim();
-      if (!to || !body) return usage(ctx, "Usage: /agent-execute <agent> <message>");
-      const from = await currentAgent(ctx);
-      const msg = await appendAgentMessage(to, { type: "execute", from, body, status: "processing" });
-      await switchToAgent(pi, to, ctx, `Execute from ${from} (${msg.id})`, `Execute this agent-execute message. Metadata: ${JSON.stringify(msg)}\n\nTask:\n${body}`);
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("/agent-execute is disabled until live-agent IPC exists. Use /agent-task, /agent-tell, or future /agent-ask clone consultations.", "warning");
     },
   });
 
