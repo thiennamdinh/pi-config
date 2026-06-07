@@ -337,6 +337,30 @@ function artifactRelativePath(agent: string, artifactPath: string) {
   return relative(agentDir(agent), artifactPath);
 }
 
+async function latestAssistantText(sessionDirectory: string) {
+  const { readdir } = await import("node:fs/promises");
+  if (!(await exists(sessionDirectory))) return "";
+  const files = (await readdir(sessionDirectory)).filter((file) => file.endsWith(".jsonl")).sort();
+  const latest = files.at(-1);
+  if (!latest) return "";
+  const lines = (await readFile(join(sessionDirectory, latest), "utf8")).split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      const message = entry.message;
+      if (entry.type !== "message" || message?.role !== "assistant") continue;
+      return (message.content ?? [])
+        .filter((part: any) => part?.type === "text")
+        .map((part: any) => part.text)
+        .join("\n")
+        .trim();
+    } catch {
+      // Ignore malformed lines in recovery path.
+    }
+  }
+  return "";
+}
+
 function buildClonePrompt(target: string, from: string, requestId: string, body: string) {
   return `You are an ephemeral read-only consultation clone of agent ${target}.
 
@@ -420,7 +444,9 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     error = err instanceof Error ? err.message : String(err);
   }
 
-  const answer = stdout || (status === "failed" ? `Agent clone failed: ${error ?? "unknown error"}` : "(no answer)");
+  const recovered = await latestAssistantText(tmpSessionDir).catch(() => "");
+  const answer = recovered || stdout || (status === "failed" ? `Agent clone failed: ${error ?? "unknown error"}` : "(no answer)");
+  if (status === "done" && !answer.trim()) status = "failed";
   const completedAt = nowIso();
   const artifact = `# Agent ask: ${from} → ${target}
 
