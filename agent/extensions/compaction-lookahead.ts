@@ -84,6 +84,35 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
   return messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
+function safeNotify(ctx: ExtensionContext, message: string, level: "info" | "warning" = "info"): void {
+  try {
+    if (ctx.hasUI) ctx.ui.notify(message, level);
+  } catch {
+    // UI contexts can become stale after reload/session replacement. Lookahead
+    // must never turn a background status update into a process crash.
+  }
+}
+
+function safeSetStatus(ctx: ExtensionContext, value: string | undefined): void {
+  try {
+    if (ctx.hasUI) ctx.ui.setStatus("lookahead", value);
+  } catch {
+    // See safeNotify.
+  }
+}
+
+function clearStatusLater(ctx: ExtensionContext, ms: number): void {
+  setTimeout(() => safeSetStatus(ctx, undefined), ms);
+}
+
+function runInBackground(promise: Promise<void>): void {
+  promise.catch((error) => {
+    // Last-ditch guard. Individual jobs should catch and report their own
+    // failures, but an unhandled rejection from a hook must not kill Pi.
+    console.error("Compaction lookahead background job failed:", error);
+  });
+}
+
 function reportLookaheadError(ctx: ExtensionContext, sessionFile: string, label: string, error: unknown): void {
   try {
     writeError(sessionFile, error);
@@ -91,8 +120,8 @@ function reportLookaheadError(ctx: ExtensionContext, sessionFile: string, label:
     // Keep lookahead failures non-fatal; this runs from startup/compaction hooks.
   }
   const message = error instanceof Error ? error.message : String(error);
-  ctx.ui.notify(`${label}: ${message}`, "warning");
-  ctx.ui.setStatus("lookahead", undefined);
+  safeNotify(ctx, `${label}: ${message}`, "warning");
+  safeSetStatus(ctx, undefined);
 }
 
 function firstEntryAfter(branch: SessionEntry[], entryId: string): SessionEntry | undefined {
@@ -114,10 +143,11 @@ function latestCompaction(branch: SessionEntry[]): CompactionEntry | undefined {
 }
 
 async function getModelAuth(ctx: ExtensionContext) {
-  if (!ctx.model) throw new Error("No active model available for compaction lookahead.");
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+  const model = ctx.model;
+  if (!model) throw new Error("No active model available for compaction lookahead.");
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) throw new Error(auth.error);
-  return { model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
+  return { model, apiKey: auth.apiKey, headers: auth.headers };
 }
 
 function contextMessagesFromBranch(branch: SessionEntry[], leafId?: string | null): AgentMessage[] {
@@ -141,7 +171,7 @@ async function computeLookaheadThroughEntry(
   if (inFlight.has(key)) return;
   inFlight.add(key);
 
-  ctx.ui.setStatus("lookahead", `summarizing… (${reason})`);
+  safeSetStatus(ctx, `summarizing… (${reason})`);
 
   try {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -150,6 +180,7 @@ async function computeLookaheadThroughEntry(
     const settings = readCompactionSettings();
     const messages = contextMessagesFromBranch(branch, leafId);
     const estimate = estimateMessagesTokens(messages);
+    const thinkingLevel = pi.getThinkingLevel();
     const { model, apiKey, headers } = await getModelAuth(ctx);
     const summary = await generateSummary(
       messages,
@@ -160,7 +191,7 @@ async function computeLookaheadThroughEntry(
       undefined,
       "Produce the next lookahead compaction summary. Preserve all durable decisions, constraints, current state, open tasks, and file context needed after the retained raw window is dropped.",
       undefined,
-      pi.getThinkingLevel(),
+      thinkingLevel,
     );
 
     writeCache(cachePath(sessionFile), {
@@ -176,9 +207,9 @@ async function computeLookaheadThroughEntry(
       settings,
       model: `${model.provider}/${model.id}`,
     });
-    ctx.ui.notify("Compaction lookahead: next summary is ready.", "info");
-    ctx.ui.setStatus("lookahead", "ready");
-    setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
+    safeNotify(ctx, "Compaction lookahead: next summary is ready.", "info");
+    safeSetStatus(ctx, "ready");
+    clearStatusLater(ctx, READY_STATUS_MS);
   } catch (error: unknown) {
     reportLookaheadError(ctx, sessionFile, "Compaction lookahead failed", error);
   } finally {
@@ -193,7 +224,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
   if (inFlight.has(key)) return;
   inFlight.add(key);
 
-  ctx.ui.setStatus("lookahead", "summarizing… (bootstrap)");
+  safeSetStatus(ctx, "summarizing… (bootstrap)");
 
   try {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -205,6 +236,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
     const approxSummarizeTokens = estimateMessagesTokens(preparation.messagesToSummarize);
     if (approxSummarizeTokens < MIN_BOOTSTRAP_TOKENS_TO_SUMMARIZE) return;
 
+    const thinkingLevel = pi.getThinkingLevel();
     const { model, apiKey, headers } = await getModelAuth(ctx);
     const result = await compact(
       preparation,
@@ -213,7 +245,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       headers,
       "Prepare a cached first compaction summary. Preserve all durable decisions, constraints, current state, open tasks, and file context.",
       undefined,
-      pi.getThinkingLevel(),
+      thinkingLevel,
     );
 
     writeCache(cachePath(sessionFile), {
@@ -228,9 +260,9 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       settings,
       model: `${model.provider}/${model.id}`,
     });
-    ctx.ui.notify("Compaction lookahead: first compaction summary is ready.", "info");
-    ctx.ui.setStatus("lookahead", "ready");
-    setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
+    safeNotify(ctx, "Compaction lookahead: first compaction summary is ready.", "info");
+    safeSetStatus(ctx, "ready");
+    clearStatusLater(ctx, READY_STATUS_MS);
   } catch (error: unknown) {
     reportLookaheadError(ctx, sessionFile, "Compaction lookahead bootstrap failed", error);
   } finally {
@@ -244,15 +276,16 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (!sessionFile) {
-        ctx.ui.notify("No persisted session file; no lookahead cache.", "warning");
+        safeNotify(ctx, "No persisted session file; no lookahead cache.", "warning");
         return;
       }
       const cache = readCache(cachePath(sessionFile));
       if (!cache) {
-        ctx.ui.notify("No compaction lookahead cache for this session.", "warning");
+        safeNotify(ctx, "No compaction lookahead cache for this session.", "warning");
         return;
       }
-      ctx.ui.notify(
+      safeNotify(
+        ctx,
         `Compaction lookahead cache: ${cache.mode}, created ${cache.createdAt}, model ${cache.model ?? "unknown"}`,
         "info",
       );
@@ -264,17 +297,17 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (!sessionFile) {
-        ctx.ui.notify("No persisted session file; cannot prepare lookahead cache.", "warning");
+        safeNotify(ctx, "No persisted session file; cannot prepare lookahead cache.", "warning");
         return;
       }
       const leaf = ctx.sessionManager.getLeafEntry();
       if (!leaf?.id) {
-        ctx.ui.notify("No session leaf; cannot prepare lookahead cache.", "warning");
+        safeNotify(ctx, "No session leaf; cannot prepare lookahead cache.", "warning");
         return;
       }
       const compaction = latestCompaction(ctx.sessionManager.getBranch());
-      void computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction?.id, "session-start");
-      ctx.ui.notify("Compaction lookahead: manual preparation started.", "info");
+      runInBackground(computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction?.id, "session-start"));
+      safeNotify(ctx, "Compaction lookahead: manual preparation started.", "info");
     },
   });
 
@@ -292,7 +325,7 @@ export default function compactionLookahead(pi: ExtensionAPI) {
 
     const triggerAt = usage.contextWindow - settings.reserveTokens;
     if (usage.tokens >= triggerAt - BOOTSTRAP_MARGIN_TOKENS) {
-      void computeBootstrapLookahead(pi, ctx);
+      runInBackground(computeBootstrapLookahead(pi, ctx));
     }
   });
 
@@ -318,7 +351,7 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     }
 
     if (!firstKeptEntryId) return;
-    ctx.ui.notify("Compaction lookahead: using cached summary.", "info");
+    safeNotify(ctx, "Compaction lookahead: using cached summary.", "info");
     return {
       compaction: {
         summary: cache.summary,
@@ -338,7 +371,7 @@ export default function compactionLookahead(pi: ExtensionAPI) {
 
   pi.on("session_compact", async (event, ctx) => {
     if (!shouldRunAutomaticLookahead(ctx)) return;
-    void computeLookaheadThroughEntry(pi, ctx, event.compactionEntry.id, event.compactionEntry.id, "post-compaction");
+    runInBackground(computeLookaheadThroughEntry(pi, ctx, event.compactionEntry.id, event.compactionEntry.id, "post-compaction"));
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -347,8 +380,8 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     if (!sessionFile) return;
     const cache = readCache(cachePath(sessionFile));
     if (cache) {
-      ctx.ui.setStatus("lookahead", `cache:${cache.mode}`);
-      setTimeout(() => ctx.ui.setStatus("lookahead", undefined), 5000);
+      safeSetStatus(ctx, `cache:${cache.mode}`);
+      clearStatusLater(ctx, 5000);
       return;
     }
 
@@ -360,7 +393,7 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     const compaction = latestCompaction(branch);
     const leaf = ctx.sessionManager.getLeafEntry();
     if (compaction?.id && leaf?.id) {
-      void computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction.id, "session-start");
+      runInBackground(computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction.id, "session-start"));
     }
   });
 }
