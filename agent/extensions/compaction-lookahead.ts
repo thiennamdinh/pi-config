@@ -59,6 +59,12 @@ function writeCache(path: string, cache: LookaheadCache): void {
   renameSync(tmp, path);
 }
 
+function writeError(sessionFile: string, error: unknown): void {
+  const path = `${sessionFile}.compaction-lookahead.error.log`;
+  const message = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+  writeFileSync(path, `[${new Date().toISOString()}]\n${message}\n`, "utf8");
+}
+
 function readCache(path: string): LookaheadCache | undefined {
   if (!existsSync(path)) return undefined;
   try {
@@ -95,6 +101,7 @@ function latestCompaction(branch: SessionEntry[]): CompactionEntry | undefined {
 async function getModelAuth(ctx: ExtensionContext) {
   if (!ctx.model) throw new Error("No active model available for compaction lookahead.");
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+  if (!auth.ok) throw new Error(auth.error);
   return { model: ctx.model, apiKey: auth.apiKey, headers: auth.headers };
 }
 
@@ -111,6 +118,12 @@ async function computeLookaheadThroughEntry(
 ): Promise<void> {
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) return;
+  const sessionId = ctx.sessionManager.getSessionId();
+  const leafId = ctx.sessionManager.getLeafId();
+  const branch = ctx.sessionManager.getBranch();
+  const settings = readCompactionSettings();
+  const messages = contextMessagesFromBranch(branch, leafId);
+  const estimate = estimateContextTokens(messages).tokens;
   const key = `${sessionFile}:post:${coveredEntryId}`;
   if (inFlight.has(key)) return;
   inFlight.add(key);
@@ -118,10 +131,6 @@ async function computeLookaheadThroughEntry(
   ctx.ui.setStatus("lookahead", `summarizing… (${reason})`);
 
   try {
-    const branch = ctx.sessionManager.getBranch();
-    const messages = contextMessagesFromBranch(branch, ctx.sessionManager.getLeafId());
-    const estimate = estimateContextTokens(messages).tokens;
-    const settings = readCompactionSettings();
     const { model, apiKey, headers } = await getModelAuth(ctx);
     const summary = await generateSummary(
       messages,
@@ -135,14 +144,11 @@ async function computeLookaheadThroughEntry(
       pi.getThinkingLevel(),
     );
 
-    const currentSessionFile = ctx.sessionManager.getSessionFile();
-    if (currentSessionFile !== sessionFile) return;
-
     writeCache(cachePath(sessionFile), {
       version: 1,
       mode: "post-compaction",
       sessionFile,
-      sessionId: ctx.sessionManager.getSessionId(),
+      sessionId,
       createdAt: new Date().toISOString(),
       summary,
       coveredEntryId,
@@ -155,6 +161,7 @@ async function computeLookaheadThroughEntry(
     ctx.ui.setStatus("lookahead", "ready");
     setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
   } catch (error: any) {
+    writeError(sessionFile, error);
     ctx.ui.notify(`Compaction lookahead failed: ${error?.message ?? String(error)}`, "warning");
     ctx.ui.setStatus("lookahead", undefined);
   } finally {
@@ -165,6 +172,10 @@ async function computeLookaheadThroughEntry(
 async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) return;
+  const sessionId = ctx.sessionManager.getSessionId();
+  const settings = readCompactionSettings();
+  const branch = ctx.sessionManager.getBranch();
+  const preparation = prepareCompaction(branch, settings);
   const key = `${sessionFile}:bootstrap`;
   if (inFlight.has(key)) return;
   inFlight.add(key);
@@ -172,9 +183,6 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
   ctx.ui.setStatus("lookahead", "summarizing… (bootstrap)");
 
   try {
-    const settings = readCompactionSettings();
-    const branch = ctx.sessionManager.getBranch();
-    const preparation = prepareCompaction(branch, settings);
     if (!preparation) return;
     if (preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0) return;
     const approxSummarizeTokens = estimateContextTokens(preparation.messagesToSummarize).tokens;
@@ -191,14 +199,11 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       pi.getThinkingLevel(),
     );
 
-    const currentSessionFile = ctx.sessionManager.getSessionFile();
-    if (currentSessionFile !== sessionFile) return;
-
     writeCache(cachePath(sessionFile), {
       version: 1,
       mode: "bootstrap",
       sessionFile,
-      sessionId: ctx.sessionManager.getSessionId(),
+      sessionId,
       createdAt: new Date().toISOString(),
       summary: result.summary,
       firstKeptEntryId: result.firstKeptEntryId,
@@ -210,6 +215,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
     ctx.ui.setStatus("lookahead", "ready");
     setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
   } catch (error: any) {
+    writeError(sessionFile, error);
     ctx.ui.notify(`Compaction lookahead bootstrap failed: ${error?.message ?? String(error)}`, "warning");
     ctx.ui.setStatus("lookahead", undefined);
   } finally {
