@@ -101,15 +101,21 @@ function contextMessagesFromBranch(branch: SessionEntry[], leafId?: string | nul
   return buildSessionContext(branch, leafId).messages;
 }
 
-async function computePostCompactionLookahead(pi: ExtensionAPI, ctx: ExtensionContext, compactionEntry: CompactionEntry): Promise<void> {
+async function computeLookaheadThroughEntry(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  coveredEntryId: string,
+  sourceCompactionId: string | undefined,
+  reason: "post-compaction" | "session-start",
+): Promise<void> {
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) return;
-  const key = `${sessionFile}:post:${compactionEntry.id}`;
+  const key = `${sessionFile}:post:${coveredEntryId}`;
   if (inFlight.has(key)) return;
   inFlight.add(key);
 
   ctx.ui.setStatus("lookahead", "summarizing next compaction…");
-  ctx.ui.notify("Compaction lookahead: preparing next summary in background.", "info");
+  ctx.ui.notify(`Compaction lookahead: preparing next summary in background (${reason}).`, "info");
 
   try {
     const branch = ctx.sessionManager.getBranch();
@@ -139,8 +145,8 @@ async function computePostCompactionLookahead(pi: ExtensionAPI, ctx: ExtensionCo
       sessionId: ctx.sessionManager.getSessionId(),
       createdAt: new Date().toISOString(),
       summary,
-      coveredEntryId: compactionEntry.id,
-      sourceCompactionId: compactionEntry.id,
+      coveredEntryId,
+      sourceCompactionId,
       tokensBeforeEstimate: estimate,
       settings,
       model: `${model.provider}/${model.id}`,
@@ -287,7 +293,7 @@ export default function compactionLookahead(pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (event, ctx) => {
-    void computePostCompactionLookahead(pi, ctx, event.compactionEntry);
+    void computeLookaheadThroughEntry(pi, ctx, event.compactionEntry.id, event.compactionEntry.id, "post-compaction");
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -297,6 +303,18 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     if (cache) {
       ctx.ui.setStatus("lookahead", `cache:${cache.mode}`);
       setTimeout(() => ctx.ui.setStatus("lookahead", undefined), 5000);
+      return;
+    }
+
+    // If Pi is reloaded/resumed after a session already has a compaction,
+    // there is no session_compact event to seed the lookahead cache. Prepare a
+    // cache through the current leaf so the next official compaction can still
+    // be fast and keep only messages written after this point.
+    const branch = ctx.sessionManager.getBranch();
+    const compaction = latestCompaction(branch);
+    const leaf = ctx.sessionManager.getLeafEntry();
+    if (compaction?.id && leaf?.id) {
+      void computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction.id, "session-start");
     }
   });
 }
