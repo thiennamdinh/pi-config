@@ -4,7 +4,9 @@ import { Type } from "typebox";
 import { constants } from "node:fs";
 import { access, appendFile, cp, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const HOME = process.env.HOME ?? ".";
 const AGENTS_ROOT = join(HOME, ".pi", "agents");
@@ -12,6 +14,8 @@ const TRASH_ROOT = join(AGENTS_ROOT, ".trash");
 const EPHEMERAL_PI_SESSION_DIR = join(HOME, ".pi", "agent", "tmp", "pi-ephemeral-sessions");
 const EXT_CUSTOM_TYPE = "agent-workspaces";
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
+const IS_EPHEMERAL_CLONE = Boolean(process.env.PI_AGENT_EPHEMERAL_CLONE);
+const execFileAsync = promisify(execFile);
 
 let allowNextManagedSwitchToPi = false;
 
@@ -27,7 +31,7 @@ type Manifest = {
   maxRuntimeSeconds?: number;
 };
 
-type MessageType = "tell" | "ask" | "task" | "execute" | "answer" | "event";
+type MessageType = "tell" | "ask" | "ask_request" | "task" | "execute" | "answer" | "ask_answer" | "event";
 
 type AgentMessage = {
   id: string;
@@ -37,7 +41,11 @@ type AgentMessage = {
   body: string;
   replyTo?: string;
   createdAt: string;
-  status: "queued" | "processing" | "done" | "failed";
+  status: "queued" | "processing" | "done" | "failed" | "absorbed";
+  artifactPath?: string;
+  error?: string;
+  updatedAt?: string;
+  absorbedAt?: string;
 };
 
 let activeAgent: string | null = null;
@@ -290,6 +298,194 @@ async function appendAgentMessage(to: string, message: Omit<AgentMessage, "id" |
   return full;
 }
 
+async function appendAgentMessageFrom(fromAgent: string, message: Omit<AgentMessage, "id" | "createdAt" | "status"> & { status?: AgentMessage["status"] }) {
+  fromAgent = sanitizeTargetName(fromAgent);
+  const full: AgentMessage = {
+    id: makeId("msg"),
+    from: fromAgent,
+    createdAt: nowIso(),
+    status: message.status ?? "queued",
+    ...message,
+  } as AgentMessage;
+  if (fromAgent === "pi") return full;
+  if (!(await exists(manifestPath(fromAgent)))) throw new Error(`Unknown agent: ${fromAgent}`);
+  await appendFile(messagesPath(fromAgent), `${JSON.stringify(full)}\n`);
+  return full;
+}
+
+function preview(text: string, max = 1200) {
+  const oneLine = text.trim().replace(/\s+/g, " ");
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+function markdownEscapeFence(text: string) {
+  return text.replace(/```/g, "`\\`\\`");
+}
+
+function parseTargetAndBody(args: string): [string, string] | undefined {
+  const [to, ...bodyParts] = args.trim().split(/\s+/);
+  const body = bodyParts.join(" ").trim();
+  if (!to || !body) return undefined;
+  return [to, body];
+}
+
+function consultationDir(agent: string, id: string) {
+  return join(agentDir(agent), "artifacts", "consultations", id);
+}
+
+function artifactRelativePath(agent: string, artifactPath: string) {
+  return relative(agentDir(agent), artifactPath);
+}
+
+function buildClonePrompt(target: string, from: string, requestId: string, body: string) {
+  return `You are an ephemeral read-only consultation clone of agent ${target}.
+
+Your answer will be returned to ${from} and logged for the real ${target}. You are advisory: do not assume your response is automatically absorbed by the live target session. If you make durable observations the real ${target} should remember, include a short section titled "Notes for ${target}".
+
+Rules:
+- Answer the caller's question directly and concisely, but include enough detail to be useful.
+- Treat this as read-only consultation. Do not edit files or perform side effects.
+- If more context is needed, say what would be needed.
+- Request id: ${requestId}
+- Caller: ${from}
+- Target agent: ${target}
+
+Caller request:
+${body}`;
+}
+
+async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, targetRaw: string, body: string) {
+  const target = sanitizeName(targetRaw);
+  if (!(await exists(manifestPath(target)))) throw new Error(`Unknown agent: ${target}`);
+  const from = await currentAgent(ctx);
+  const manifest = await readManifest(target);
+  const requestId = makeId("ask");
+  const dir = consultationDir(target, requestId);
+  const tmpSessionDir = join(dir, "session");
+  const artifactPath = join(dir, "answer.md");
+  await mkdir(tmpSessionDir, { recursive: true });
+
+  const request = await appendAgentMessage(target, {
+    type: "ask_request",
+    from,
+    body,
+    status: "processing",
+    artifactPath: artifactRelativePath(target, artifactPath),
+  });
+  let callerRequest: AgentMessage | undefined;
+  if (from !== "pi") {
+    callerRequest = await appendAgentMessageFrom(from, {
+      type: "ask_request",
+      to: target,
+      body,
+      status: "processing",
+      replyTo: request.id,
+      artifactPath: artifactRelativePath(target, artifactPath),
+    });
+  }
+
+  const model = manifest.model ? ["--model", manifest.model] : [];
+  const thinking = manifest.thinkingLevel ? ["--thinking", manifest.thinkingLevel] : [];
+  const prompt = buildClonePrompt(target, from, request.id, body);
+  const args = [
+    "-p",
+    "--session-dir",
+    tmpSessionDir,
+    "--no-context-files",
+    "--tools",
+    "read,grep,find,ls",
+    ...model,
+    ...thinking,
+    prompt,
+  ];
+
+  const startedAt = nowIso();
+  let stdout = "";
+  let stderr = "";
+  let status: AgentMessage["status"] = "done";
+  let error: string | undefined;
+  try {
+    const result = await execFileAsync("pi", args, {
+      cwd: agentDir(target),
+      env: { ...process.env, PI_AGENT_EPHEMERAL_CLONE: "1" },
+      timeout: (manifest.maxRuntimeSeconds ?? 600) * 1000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    stdout = result.stdout.trim();
+    stderr = result.stderr.trim();
+  } catch (err: any) {
+    status = "failed";
+    stdout = String(err?.stdout ?? "").trim();
+    stderr = String(err?.stderr ?? "").trim();
+    error = err instanceof Error ? err.message : String(err);
+  }
+
+  const answer = stdout || (status === "failed" ? `Agent clone failed: ${error ?? "unknown error"}` : "(no answer)");
+  const completedAt = nowIso();
+  const artifact = `# Agent ask: ${from} → ${target}
+
+- request id: ${request.id}
+- clone id: ${requestId}
+- status: ${status}
+- started: ${startedAt}
+- completed: ${completedAt}
+- model: ${manifest.model ?? "default"}
+- thinking: ${manifest.thinkingLevel ?? "default"}
+- session dir: ${tmpSessionDir}
+
+## Question
+
+${body}
+
+## Answer
+
+${answer}
+
+## Diagnostics
+
+### stderr
+
+\`\`\`text
+${markdownEscapeFence(stderr || "(empty)")}
+\`\`\`
+
+### error
+
+\`\`\`text
+${markdownEscapeFence(error ?? "(none)")}
+\`\`\`
+`;
+  await writeFile(artifactPath, artifact);
+
+  await updateAgentMessage(target, request.id, { status, error });
+  if (callerRequest && from !== "pi") await updateAgentMessage(from, callerRequest.id, { status, error });
+
+  const answerMsg = await appendAgentMessage(target, {
+    type: "ask_answer",
+    from: `${target}:clone`,
+    body: preview(answer),
+    replyTo: request.id,
+    status,
+    artifactPath: artifactRelativePath(target, artifactPath),
+    error,
+  });
+  if (from !== "pi") {
+    await appendAgentMessageFrom(from, {
+      type: "ask_answer",
+      to: from,
+      from: `${target}:clone`,
+      body: preview(answer),
+      replyTo: request.id,
+      status,
+      artifactPath: artifactRelativePath(target, artifactPath),
+      error,
+    } as any);
+  }
+
+  ctx.ui.notify(`${target} clone ${status}: ${answer}\n\nArtifact: ${artifactPath}`, status === "done" ? "info" : "warning");
+  return { request, answer: answerMsg, artifactPath, status };
+}
+
 async function currentAgent(ctx: ExtensionCommandContext) {
   return currentAgentFromCwd(ctx.cwd) ?? "pi";
 }
@@ -342,7 +538,7 @@ async function releaseLock() {
   activeAgent = null;
 }
 
-async function queuedMessages(name: string) {
+async function readAgentMessages(name: string) {
   const path = messagesPath(name);
   if (!(await exists(path))) return [] as AgentMessage[];
   const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line.trim());
@@ -354,7 +550,35 @@ async function queuedMessages(name: string) {
         return undefined;
       }
     })
-    .filter((msg): msg is AgentMessage => Boolean(msg) && (msg.status === "queued" || msg.status === "processing"));
+    .filter((msg): msg is AgentMessage => Boolean(msg));
+}
+
+async function writeAgentMessages(name: string, messages: AgentMessage[]) {
+  await writeFile(messagesPath(name), `${messages.map((msg) => JSON.stringify(msg)).join("\n")}\n`);
+}
+
+async function queuedMessages(name: string) {
+  return (await readAgentMessages(name)).filter((msg) => {
+    if (msg.status === "absorbed" || msg.status === "failed") return false;
+    return msg.status === "queued" || msg.status === "processing" || msg.status === "done";
+  });
+}
+
+async function updateAgentMessage(name: string, id: string, patch: Partial<AgentMessage>) {
+  const messages = await readAgentMessages(name);
+  let found = false;
+  const updated = messages.map((msg) => {
+    if (msg.id !== id) return msg;
+    found = true;
+    return { ...msg, ...patch, updatedAt: nowIso() };
+  });
+  if (!found) return false;
+  await writeAgentMessages(name, updated);
+  return true;
+}
+
+async function markMessageAbsorbed(name: string, id: string) {
+  return updateAgentMessage(name, id, { status: "absorbed", absorbedAt: nowIso() });
 }
 
 async function agentInstructions(name: string) {
@@ -389,7 +613,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     const name = currentAgentFromCwd(ctx.cwd);
     if (name) {
       try {
-        await acquireLock(name, ctx);
+        if (!IS_EPHEMERAL_CLONE) await acquireLock(name, ctx);
         await applyManifest(pi, name, ctx as any);
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
@@ -574,13 +798,24 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-ask", {
-    description: "Ask another agent via an ephemeral read-only clone (not implemented yet)",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    description: "Ask another agent via an ephemeral read-only clone",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
-      const [to, ...bodyParts] = args.trim().split(/\s+/);
-      const body = bodyParts.join(" ").trim();
-      if (!to || !body) return usage(ctx, "Usage: /agent-ask <agent> <question>");
-      ctx.ui.notify("/agent-ask clone consultations are planned but not implemented yet. The old live-session switch path is disabled because it can crash Pi.", "warning");
+      const parsed = parseTargetAndBody(args);
+      if (!parsed) return usage(ctx, "Usage: /agent-ask <agent> <question>");
+      const [to, body] = parsed;
+      await runAgentAskClone(pi, ctx, to, body);
+    },
+  });
+
+  pi.registerCommand("agent-consult", {
+    description: "Alias for /agent-ask",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: async (args, ctx) => {
+      const parsed = parseTargetAndBody(args);
+      if (!parsed) return usage(ctx, "Usage: /agent-consult <agent> <question>");
+      const [to, body] = parsed;
+      await runAgentAskClone(pi, ctx, to, body);
     },
   });
 
@@ -588,7 +823,33 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     description: "Deprecated live run-now command (disabled until live IPC exists)",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (_args, ctx) => {
-      ctx.ui.notify("/agent-execute is disabled until live-agent IPC exists. Use /agent-task, /agent-tell, or future /agent-ask clone consultations.", "warning");
+      ctx.ui.notify("/agent-execute is disabled until live-agent IPC exists. Use /agent-task, /agent-tell, or /agent-ask clone consultations.", "warning");
+    },
+  });
+
+  pi.registerCommand("agent-inbox", {
+    description: "List queued/unabsorbed messages for the current or named agent",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: async (args, ctx) => {
+      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Usage: /agent-inbox [agent]");
+      const messages = await queuedMessages(name);
+      if (!messages.length) return ctx.ui.notify(`No queued/unabsorbed messages for ${name}.`, "info");
+      ctx.ui.notify(messages.map((msg) => `${msg.id}  ${msg.type}  ${msg.status}  from:${msg.from}\n${msg.body}${msg.artifactPath ? `\nartifact: ${join(agentDir(name), msg.artifactPath)}` : ""}`).join("\n\n"), "info");
+    },
+  });
+
+  pi.registerCommand("agent-absorb", {
+    description: "Mark an inbox/consultation message absorbed for the current agent",
+    handler: async (args, ctx) => {
+      const name = currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Usage: /agent-absorb <message-id> (inside a named agent)");
+      const id = args.trim();
+      if (!id) return usage(ctx, "Usage: /agent-absorb <message-id>");
+      const ok = await markMessageAbsorbed(name, id);
+      if (!ok) return ctx.ui.notify(`No message ${id} in ${name}'s inbox.`, "warning");
+      await appendAgentMessage(name, { type: "event", from: name, body: `absorbed ${id}`, replyTo: id, status: "absorbed", absorbedAt: nowIso() } as any);
+      ctx.ui.notify(`Marked ${id} absorbed for ${name}.`, "info");
     },
   });
 
