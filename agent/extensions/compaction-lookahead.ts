@@ -238,6 +238,25 @@ export default function compactionLookahead(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("compaction-lookahead-prepare", {
+    description: "Prepare or refresh the compaction lookahead cache for the current session leaf.",
+    handler: async (_args, ctx) => {
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        ctx.ui.notify("No persisted session file; cannot prepare lookahead cache.", "warning");
+        return;
+      }
+      const leaf = ctx.sessionManager.getLeafEntry();
+      if (!leaf?.id) {
+        ctx.ui.notify("No session leaf; cannot prepare lookahead cache.", "warning");
+        return;
+      }
+      const compaction = latestCompaction(ctx.sessionManager.getBranch());
+      void computeLookaheadThroughEntry(pi, ctx, leaf.id, compaction?.id, "session-start");
+      ctx.ui.notify("Compaction lookahead: manual preparation started.", "info");
+    },
+  });
+
   pi.on("turn_end", async (_event, ctx) => {
     const sessionFile = ctx.sessionManager.getSessionFile();
     const usage = ctx.getContextUsage();
