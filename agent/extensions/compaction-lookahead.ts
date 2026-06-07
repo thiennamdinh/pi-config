@@ -34,6 +34,7 @@ interface LookaheadCache {
 const CUSTOM_DETAILS = { source: "compaction-lookahead", version: 1 };
 const BOOTSTRAP_MARGIN_TOKENS = 12000;
 const MIN_BOOTSTRAP_TOKENS_TO_SUMMARIZE = 8000;
+const READY_STATUS_MS = 45_000;
 
 const inFlight = new Set<string>();
 
@@ -114,8 +115,7 @@ async function computeLookaheadThroughEntry(
   if (inFlight.has(key)) return;
   inFlight.add(key);
 
-  ctx.ui.setStatus("lookahead", "summarizing next compaction…");
-  ctx.ui.notify(`Compaction lookahead: preparing next summary in background (${reason}).`, "info");
+  ctx.ui.setStatus("lookahead", `summarizing… (${reason})`);
 
   try {
     const branch = ctx.sessionManager.getBranch();
@@ -152,11 +152,13 @@ async function computeLookaheadThroughEntry(
       model: `${model.provider}/${model.id}`,
     });
     ctx.ui.notify("Compaction lookahead: next summary is ready.", "info");
+    ctx.ui.setStatus("lookahead", "ready");
+    setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
   } catch (error: any) {
     ctx.ui.notify(`Compaction lookahead failed: ${error?.message ?? String(error)}`, "warning");
+    ctx.ui.setStatus("lookahead", undefined);
   } finally {
     inFlight.delete(key);
-    ctx.ui.setStatus("lookahead", undefined);
   }
 }
 
@@ -167,8 +169,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
   if (inFlight.has(key)) return;
   inFlight.add(key);
 
-  ctx.ui.setStatus("lookahead", "preparing first compaction…");
-  ctx.ui.notify("Compaction lookahead: preparing first compaction summary in background.", "info");
+  ctx.ui.setStatus("lookahead", "summarizing… (bootstrap)");
 
   try {
     const settings = readCompactionSettings();
@@ -206,11 +207,13 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       model: `${model.provider}/${model.id}`,
     });
     ctx.ui.notify("Compaction lookahead: first compaction summary is ready.", "info");
+    ctx.ui.setStatus("lookahead", "ready");
+    setTimeout(() => ctx.ui.setStatus("lookahead", undefined), READY_STATUS_MS);
   } catch (error: any) {
     ctx.ui.notify(`Compaction lookahead bootstrap failed: ${error?.message ?? String(error)}`, "warning");
+    ctx.ui.setStatus("lookahead", undefined);
   } finally {
     inFlight.delete(key);
-    ctx.ui.setStatus("lookahead", undefined);
   }
 }
 
