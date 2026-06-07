@@ -378,6 +378,63 @@ Caller request:
 ${body}`;
 }
 
+async function finalizeRecoveredAsk(target: string, request: AgentMessage, answer: string, note = "recovered") {
+  if (!request.artifactPath) return false;
+  const artifactPath = join(agentDir(target), request.artifactPath);
+  const askId = request.artifactPath.split("/").at(-2) ?? request.id;
+  const sessionPath = join(dirname(artifactPath), "session");
+  await mkdir(dirname(artifactPath), { recursive: true });
+  await writeFile(
+    artifactPath,
+    `# Agent ask: ${request.from} → ${target}\n\n- request id: ${request.id}\n- clone id: ${askId}\n- status: done\n- ${note}: ${nowIso()}\n- session dir: ${sessionPath}\n\n## Question\n\n${request.body}\n\n## Answer\n\n${answer}\n`,
+  );
+  await updateAgentMessage(target, request.id, { status: "done" });
+  const answerBody = preview(answer);
+  const targetMessages = await readAgentMessages(target);
+  if (!targetMessages.some((msg) => msg.type === "ask_answer" && msg.replyTo === request.id)) {
+    await appendAgentMessage(target, {
+      type: "ask_answer",
+      from: `${target}:clone`,
+      body: answerBody,
+      replyTo: request.id,
+      status: "done",
+      artifactPath: request.artifactPath,
+    });
+  }
+  if (request.from !== "pi" && (await exists(manifestPath(request.from)))) {
+    const callerMessages = await readAgentMessages(request.from);
+    for (const msg of callerMessages.filter((msg) => msg.replyTo === request.id && msg.status === "processing")) {
+      await updateAgentMessage(request.from, msg.id, { status: "done" });
+    }
+    if (!callerMessages.some((msg) => msg.type === "ask_answer" && msg.replyTo === request.id)) {
+      await appendAgentMessageFrom(request.from, {
+        type: "ask_answer",
+        to: request.from,
+        from: `${target}:clone`,
+        body: answerBody,
+        replyTo: request.id,
+        status: "done",
+        artifactPath,
+      } as any);
+    }
+  }
+  return true;
+}
+
+async function recoverAgentAsks(target: string) {
+  target = sanitizeName(target);
+  const recovered: AgentMessage[] = [];
+  for (const request of await readAgentMessages(target)) {
+    if (request.type !== "ask_request" || request.status !== "processing" || !request.artifactPath) continue;
+    const sessionPath = join(dirname(join(agentDir(target), request.artifactPath)), "session");
+    const answer = await latestAssistantText(sessionPath).catch(() => "");
+    if (!answer) continue;
+    await finalizeRecoveredAsk(target, request, answer);
+    recovered.push(request);
+  }
+  return recovered;
+}
+
 async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, targetRaw: string, body: string) {
   const target = sanitizeName(targetRaw);
   if (!(await exists(manifestPath(target)))) throw new Error(`Unknown agent: ${target}`);
@@ -850,6 +907,17 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (_args, ctx) => {
       ctx.ui.notify("/agent-execute is disabled until live-agent IPC exists. Use /agent-task, /agent-tell, or /agent-ask clone consultations.", "warning");
+    },
+  });
+
+  pi.registerCommand("agent-ask-recover", {
+    description: "Recover completed clone ask answers from retained consultation sessions",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: async (args, ctx) => {
+      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Usage: /agent-ask-recover <agent>");
+      const recovered = await recoverAgentAsks(name);
+      ctx.ui.notify(recovered.length ? `Recovered ${recovered.length} ask(s) for ${name}.` : `No recoverable asks for ${name}.`, recovered.length ? "info" : "warning");
     },
   });
 
