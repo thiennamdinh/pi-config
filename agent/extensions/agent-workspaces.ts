@@ -5,8 +5,8 @@ import { constants } from "node:fs";
 import { access, appendFile, cp, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { createWriteStream } from "node:fs";
+import { spawn } from "node:child_process";
 
 const HOME = process.env.HOME ?? ".";
 const AGENTS_ROOT = join(HOME, ".pi", "agents");
@@ -15,7 +15,6 @@ const EPHEMERAL_PI_SESSION_DIR = join(HOME, ".pi", "agent", "tmp", "pi-ephemeral
 const EXT_CUSTOM_TYPE = "agent-workspaces";
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const IS_EPHEMERAL_CLONE = Boolean(process.env.PI_AGENT_EPHEMERAL_CLONE);
-const execFileAsync = promisify(execFile);
 
 let allowNextManagedSwitchToPi = false;
 
@@ -502,93 +501,45 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     prompt,
   ];
 
-  const startedAt = nowIso();
-  let stdout = "";
-  let stderr = "";
-  let status: AgentMessage["status"] = "done";
-  let error: string | undefined;
+  const stdoutPath = join(dir, "stdout.log");
+  const stderrPath = join(dir, "stderr.log");
+  const metaPath = join(dir, "job.json");
+  await writeJson(metaPath, {
+    requestId: request.id,
+    cloneId: requestId,
+    target,
+    from,
+    body,
+    args,
+    cwd: agentDir(target),
+    sessionDir: tmpSessionDir,
+    artifactPath,
+    stdoutPath,
+    stderrPath,
+    startedAt: nowIso(),
+    callerRequestId: callerRequest?.id,
+  });
+
+  const stdoutStream = createWriteStream(stdoutPath, { flags: "a" });
+  const stderrStream = createWriteStream(stderrPath, { flags: "a" });
   try {
-    const result = await execFileAsync("pi", args, {
+    const child = spawn("pi", args, {
       cwd: agentDir(target),
       env: { ...process.env, PI_AGENT_EPHEMERAL_CLONE: "1" },
-      timeout: (manifest.maxRuntimeSeconds ?? 600) * 1000,
-      maxBuffer: 10 * 1024 * 1024,
+      detached: true,
+      stdio: ["ignore", stdoutStream, stderrStream],
     });
-    stdout = result.stdout.trim();
-    stderr = result.stderr.trim();
-  } catch (err: any) {
-    status = "failed";
-    stdout = String(err?.stdout ?? "").trim();
-    stderr = String(err?.stderr ?? "").trim();
-    error = err instanceof Error ? err.message : String(err);
+    child.unref();
+    ctx.ui.notify(`Started ${target} clone ask ${request.id}. Artifact will be ${artifactPath}`, "info");
+    return { request, artifactPath, status: "processing" as const };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    await updateAgentMessage(target, request.id, { status: "failed", error });
+    if (callerRequest && from !== "pi") await updateAgentMessage(from, callerRequest.id, { status: "failed", error });
+    await writeFile(stderrPath, `${error}\n`);
+    ctx.ui.notify(`Failed to start ${target} clone ask: ${error}`, "warning");
+    return { request, artifactPath, status: "failed" as const };
   }
-
-  const recovered = await latestAssistantText(tmpSessionDir).catch(() => "");
-  const answer = recovered || stdout || (status === "failed" ? `Agent clone failed: ${error ?? "unknown error"}` : "(no answer)");
-  if (status === "done" && !answer.trim()) status = "failed";
-  const completedAt = nowIso();
-  const artifact = `# Agent ask: ${from} → ${target}
-
-- request id: ${request.id}
-- clone id: ${requestId}
-- status: ${status}
-- started: ${startedAt}
-- completed: ${completedAt}
-- model: ${manifest.model ?? "default"}
-- thinking: ${manifest.thinkingLevel ?? "default"}
-- session dir: ${tmpSessionDir}
-
-## Question
-
-${body}
-
-## Answer
-
-${answer}
-
-## Diagnostics
-
-### stderr
-
-\`\`\`text
-${markdownEscapeFence(stderr || "(empty)")}
-\`\`\`
-
-### error
-
-\`\`\`text
-${markdownEscapeFence(error ?? "(none)")}
-\`\`\`
-`;
-  await writeFile(artifactPath, artifact);
-
-  await updateAgentMessage(target, request.id, { status, error });
-  if (callerRequest && from !== "pi") await updateAgentMessage(from, callerRequest.id, { status, error });
-
-  const answerMsg = await appendAgentMessage(target, {
-    type: "ask_answer",
-    from: `${target}:clone`,
-    body: preview(answer),
-    replyTo: request.id,
-    status,
-    artifactPath: artifactRelativePath(target, artifactPath),
-    error,
-  });
-  if (from !== "pi") {
-    await appendAgentMessageFrom(from, {
-      type: "ask_answer",
-      to: from,
-      from: `${target}:clone`,
-      body: preview(answer),
-      replyTo: request.id,
-      status,
-      artifactPath: artifactRelativePath(target, artifactPath),
-      error,
-    } as any);
-  }
-
-  ctx.ui.notify(`${target} clone ${status}: ${answer}\n\nArtifact: ${artifactPath}`, status === "done" ? "info" : "warning");
-  return { request, answer: answerMsg, artifactPath, status };
 }
 
 async function currentAgent(ctx: ExtensionCommandContext) {
