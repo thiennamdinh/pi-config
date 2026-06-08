@@ -1,11 +1,10 @@
 import type { ExtensionAPI, ExtensionCommandContext, ReplacedSessionContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { constants } from "node:fs";
+import { closeSync, constants, openSync } from "node:fs";
 import { access, appendFile, cp, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
-import { createWriteStream } from "node:fs";
 import { spawn } from "node:child_process";
 
 const HOME = process.env.HOME ?? ".";
@@ -520,22 +519,30 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     callerRequestId: callerRequest?.id,
   });
 
-  const stdoutStream = createWriteStream(stdoutPath, { flags: "a" });
-  const stderrStream = createWriteStream(stderrPath, { flags: "a" });
+  let stdoutFd: number | undefined;
+  let stderrFd: number | undefined;
   try {
+    stdoutFd = openSync(stdoutPath, "a");
+    stderrFd = openSync(stderrPath, "a");
     const child = spawn("pi", args, {
       cwd: agentDir(target),
       env: { ...process.env, PI_AGENT_EPHEMERAL_CLONE: "1" },
       detached: true,
-      stdio: ["ignore", stdoutStream, stderrStream],
+      stdio: ["ignore", stdoutFd, stderrFd],
     });
     child.unref();
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+    stdoutFd = undefined;
+    stderrFd = undefined;
     ctx.ui.notify(`Started ${target} clone ask ${request.id}. Artifact will be ${artifactPath}`, "info");
     return { request, artifactPath, status: "processing" as const };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     await updateAgentMessage(target, request.id, { status: "failed", error });
     if (callerRequest && from !== "pi") await updateAgentMessage(from, callerRequest.id, { status: "failed", error });
+    if (stdoutFd !== undefined) closeSync(stdoutFd);
+    if (stderrFd !== undefined) closeSync(stderrFd);
     await writeFile(stderrPath, `${error}\n`);
     ctx.ui.notify(`Failed to start ${target} clone ask: ${error}`, "warning");
     return { request, artifactPath, status: "failed" as const };
