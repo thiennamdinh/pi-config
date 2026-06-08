@@ -443,6 +443,24 @@ async function recoverAllAgentAsks() {
   return results;
 }
 
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForAskAnswer(target: string, request: AgentMessage, timeoutMs: number) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const sessionPath = request.artifactPath ? join(dirname(join(agentDir(target), request.artifactPath)), "session") : undefined;
+    const answer = sessionPath ? await latestAssistantText(sessionPath).catch(() => "") : "";
+    if (answer) {
+      await finalizeRecoveredAsk(target, request, answer, "completed");
+      return answer;
+    }
+    await delay(1000);
+  }
+  return undefined;
+}
+
 function startRecoveryLoop(ctx: { ui: ExtensionCommandContext["ui"] }) {
   if (recoveryTimer || IS_EPHEMERAL_CLONE) return;
   recoveryTimer = setInterval(() => {
@@ -535,7 +553,6 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     closeSync(stderrFd);
     stdoutFd = undefined;
     stderrFd = undefined;
-    ctx.ui.notify(`Started ${target} clone ask ${request.id}. Artifact will be ${artifactPath}`, "info");
     return { request, artifactPath, status: "processing" as const };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
@@ -863,14 +880,33 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     },
   });
 
-  function launchAgentAsk(args: string, ctx: ExtensionCommandContext, commandName: string) {
+  async function launchAgentAsk(args: string, ctx: ExtensionCommandContext, commandName: string) {
     const parsed = parseTargetAndBody(args);
     if (!parsed) return usage(ctx, `Usage: /${commandName} <agent> <question>`);
     const [to, body] = parsed;
-    ctx.ui.notify(`Started read-only ${to} clone ask. I’ll notify when it finishes; /agent-ask-recover ${to} can recover retained answers if needed.`, "info");
-    runAgentAskClone(pi, ctx, to, body).catch((error) => {
+    const target = sanitizeName(to);
+    ctx.ui.setStatus?.("agent-ask", `asking ${target}…`);
+    ctx.ui.notify(`Asking ${target} via read-only clone…`, "info");
+    try {
+      const started = await runAgentAskClone(pi, ctx, target, body);
+      const answer = await waitForAskAnswer(target, started.request, 180_000);
+      ctx.ui.setStatus?.("agent-ask", undefined);
+      if (!answer) {
+        ctx.ui.notify(`${target} has not answered yet. Artifact: ${started.artifactPath}\nTry /agent-ask-recover ${target} shortly.`, "warning");
+        return;
+      }
+      const content = `## Agent answer: ${target}\n\n${answer}\n\n---\nArtifact: ${started.artifactPath}`;
+      pi.sendMessage({
+        customType: "agent-ask-answer",
+        content,
+        display: true,
+        details: { target, artifactPath: started.artifactPath },
+      });
+      ctx.ui.notify(`${target} answered.`, "info");
+    } catch (error) {
+      ctx.ui.setStatus?.("agent-ask", undefined);
       ctx.ui.notify(`agent ask failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-    });
+    }
   }
 
   pi.registerCommand("agent-ask", {
