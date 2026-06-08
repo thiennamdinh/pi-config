@@ -366,6 +366,7 @@ function buildClonePrompt(target: string, from: string, requestId: string, body:
 Your answer will be returned to ${from} and logged for the real ${target}. You are advisory: do not assume your response is automatically absorbed by the live target session. If you make durable observations the real ${target} should remember, include a short section titled "Notes for ${target}".
 
 Rules:
+- Answer as ${target} in first person. Do not refer to ${target} in third person except inside "Notes for ${target}".
 - Answer the caller's question directly and concisely, but include enough detail to be useful.
 - Treat this as read-only consultation. Do not edit files or perform side effects.
 - If more context is needed, say what would be needed.
@@ -886,7 +887,12 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     const [to, body] = parsed;
     const target = sanitizeName(to);
     ctx.ui.setStatus?.("agent-ask", `asking ${target}…`);
-    ctx.ui.notify(`Asking ${target} via read-only clone…`, "info");
+    pi.sendMessage({
+      customType: "agent-ask-status",
+      content: `Asking ${target} via read-only clone…`,
+      display: true,
+      details: { target, status: "started" },
+    });
     try {
       const started = await runAgentAskClone(pi, ctx, target, body);
       const answer = await waitForAskAnswer(target, started.request, 180_000);
@@ -895,7 +901,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
         ctx.ui.notify(`${target} has not answered yet. Artifact: ${started.artifactPath}\nTry /agent-ask-recover ${target} shortly.`, "warning");
         return;
       }
-      const content = `## Agent answer: ${target}\n\n${answer}\n\n---\nArtifact: ${started.artifactPath}`;
+      const content = `## Agent answer: ${target}\n\n${answer}`;
       pi.sendMessage({
         customType: "agent-ask-answer",
         content,
