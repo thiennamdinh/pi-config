@@ -16,7 +16,10 @@ const SCOPES = [
   "user-read-recently-played",
   "playlist-read-private",
   "playlist-read-collaborative",
+  "playlist-modify-private",
+  "playlist-modify-public",
   "user-library-read",
+  "user-library-modify",
 ].join(" ");
 
 type TokenFile = {
@@ -195,6 +198,27 @@ function summarizePlaylistTrack(item: any, index: number) {
   return `${index + 1}. ${track.name}${artists ? ` — ${artists}` : ""}${album}\n${track.uri}\n${track.external_urls?.spotify ?? ""}`;
 }
 
+function trackIdFromUriOrUrl(value: string) {
+  if (value.startsWith("spotify:track:")) return value.split(":")[2];
+  const match = /open\.spotify\.com\/track\/([^?/#]+)/.exec(value);
+  return match?.[1] ?? value;
+}
+
+async function resolveTrackUri(params: { uri?: string; query?: string }) {
+  if (params.uri) return params.uri;
+  if (!params.query) throw new Error("Provide either uri or query.");
+  const items = await searchSpotify(params.query, "track", 1);
+  const selected = items[0];
+  if (!selected?.uri) throw new Error(`No Spotify track found for query: ${params.query}`);
+  return selected.uri;
+}
+
+function summarizeTrack(track: any) {
+  const artists = track.artists?.map((a: any) => a.name).join(", ");
+  const album = track.album?.name ? `\nAlbum: ${track.album.name}` : "";
+  return `${track.name}${artists ? ` — ${artists}` : ""}${album}\n${track.uri}\n${track.external_urls?.spotify ?? ""}`;
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spotify-auth-url", {
     description: "Print the Spotify authorization URL for first-time setup",
@@ -256,6 +280,36 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "spotify_status",
+    label: "Spotify Status",
+    description: "Show current Spotify playback status and currently playing track.",
+    promptSnippet: "Show current Spotify playback status/current song.",
+    parameters: Type.Object({}),
+    async execute() {
+      const data = await spotifyApi("/me/player") as any;
+      if (!data) return { content: [{ type: "text", text: "Nothing is currently playing." }], details: { playing: false } };
+      const item = data.item;
+      const device = data.device ? `${data.device.name} (${data.device.type})` : "unknown device";
+      const state = data.is_playing ? "Playing" : "Paused";
+      const text = item ? `${state} on ${device}:\n${summarizeTrack(item)}` : `${state} on ${device}. No track item available.`;
+      return { content: [{ type: "text", text }], details: data };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_current_track",
+    label: "Spotify Current Track",
+    description: "Show the currently playing Spotify track.",
+    promptSnippet: "Get the current Spotify song.",
+    parameters: Type.Object({}),
+    async execute() {
+      const data = await spotifyApi("/me/player/currently-playing") as any;
+      if (!data?.item) return { content: [{ type: "text", text: "No track is currently playing." }], details: data ?? { playing: false } };
+      return { content: [{ type: "text", text: summarizeTrack(data.item) }], details: data };
+    },
+  });
+
+  pi.registerTool({
     name: "spotify_playlists",
     label: "Spotify Playlists",
     description: "List the current user's Spotify playlists.",
@@ -274,6 +328,28 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: playlists.length ? playlists.map(summarizePlaylist).join("\n\n") : "No Spotify playlists found." }],
         details: { playlists, total: data.total, limit, offset, next: data.next, previous: data.previous },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_create_playlist",
+    label: "Spotify Create Playlist",
+    description: "Create a Spotify playlist for the current user.",
+    promptSnippet: "Create a Spotify playlist.",
+    parameters: Type.Object({
+      name: Type.String(),
+      description: Type.Optional(Type.String()),
+      public: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params) {
+      const me = await spotifyApi("/me") as any;
+      const body = {
+        name: params.name,
+        description: params.description ?? "",
+        public: params.public ?? false,
+      };
+      const playlist = await spotifyApi(`/users/${encodeURIComponent(me.id)}/playlists`, { method: "POST", body: JSON.stringify(body) }) as any;
+      return { content: [{ type: "text", text: `Created playlist:\n${summarizePlaylist(playlist, 0)}` }], details: { playlist } };
     },
   });
 
@@ -298,6 +374,45 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: items.length ? items.map(summarizePlaylistTrack).join("\n\n") : "No playlist tracks found." }],
         details: { playlistId, items, total: data.total, limit, offset, next: data.next, previous: data.previous },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_playlist_add_tracks",
+    label: "Spotify Playlist Add Tracks",
+    description: "Add Spotify tracks to a playlist by track URIs or search queries.",
+    promptSnippet: "Add tracks to a Spotify playlist.",
+    parameters: Type.Object({
+      playlist: Type.String({ description: "Spotify playlist URI, URL, or ID." }),
+      uris: Type.Optional(Type.Array(Type.String({ description: "Spotify track URIs/URLs/IDs." }))),
+      queries: Type.Optional(Type.Array(Type.String({ description: "Track search queries to resolve and add." }))),
+    }),
+    async execute(_id, params) {
+      const playlistId = playlistIdFromUriOrUrl(params.playlist);
+      const uris = [...(params.uris ?? [])];
+      for (const query of params.queries ?? []) uris.push(await resolveTrackUri({ query }));
+      if (!uris.length) throw new Error("Provide at least one track URI or query.");
+      const normalized = uris.map((uri) => uri.startsWith("spotify:track:") ? uri : `spotify:track:${trackIdFromUriOrUrl(uri)}`);
+      const data = await spotifyApi(`/playlists/${encodeURIComponent(playlistId)}/tracks`, { method: "POST", body: JSON.stringify({ uris: normalized }) }) as any;
+      return { content: [{ type: "text", text: `Added ${normalized.length} track(s) to playlist ${playlistId}.` }], details: { playlistId, uris: normalized, snapshotId: data?.snapshot_id } };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_playlist_remove_tracks",
+    label: "Spotify Playlist Remove Tracks",
+    description: "Remove Spotify tracks from a playlist by track URIs, URLs, or IDs.",
+    promptSnippet: "Remove tracks from a Spotify playlist.",
+    parameters: Type.Object({
+      playlist: Type.String({ description: "Spotify playlist URI, URL, or ID." }),
+      uris: Type.Array(Type.String({ description: "Spotify track URIs/URLs/IDs to remove." })),
+    }),
+    async execute(_id, params) {
+      const playlistId = playlistIdFromUriOrUrl(params.playlist);
+      const tracks = params.uris.map((uri) => ({ uri: uri.startsWith("spotify:track:") ? uri : `spotify:track:${trackIdFromUriOrUrl(uri)}` }));
+      if (!tracks.length) throw new Error("Provide at least one track URI.");
+      const data = await spotifyApi(`/playlists/${encodeURIComponent(playlistId)}/tracks`, { method: "DELETE", body: JSON.stringify({ tracks }) }) as any;
+      return { content: [{ type: "text", text: `Removed ${tracks.length} track(s) from playlist ${playlistId}.` }], details: { playlistId, tracks, snapshotId: data?.snapshot_id } };
     },
   });
 
@@ -378,6 +493,52 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: "Paused Spotify playback." }],
         details: { deviceId: params.deviceId },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_like_track",
+    label: "Spotify Like Track",
+    description: "Save a track to the user's Spotify Liked Songs, by URI/query or current track.",
+    promptSnippet: "Like/save a Spotify track.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String()),
+      uri: Type.Optional(Type.String()),
+      current: Type.Optional(Type.Boolean({ description: "Like the currently playing track." })),
+    }),
+    async execute(_id, params) {
+      let uri = params.current ? undefined : await resolveTrackUri(params);
+      if (params.current) {
+        const data = await spotifyApi("/me/player/currently-playing") as any;
+        uri = data?.item?.uri;
+        if (!uri) throw new Error("No current track to like.");
+      }
+      const id = trackIdFromUriOrUrl(uri!);
+      await spotifyApi(`/me/tracks?ids=${encodeURIComponent(id)}`, { method: "PUT" });
+      return { content: [{ type: "text", text: `Liked track: spotify:track:${id}` }], details: { id, uri: `spotify:track:${id}` } };
+    },
+  });
+
+  pi.registerTool({
+    name: "spotify_unlike_track",
+    label: "Spotify Unlike Track",
+    description: "Remove a track from the user's Spotify Liked Songs, by URI/query or current track.",
+    promptSnippet: "Unlike/remove a Spotify track from Liked Songs.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String()),
+      uri: Type.Optional(Type.String()),
+      current: Type.Optional(Type.Boolean({ description: "Unlike the currently playing track." })),
+    }),
+    async execute(_id, params) {
+      let uri = params.current ? undefined : await resolveTrackUri(params);
+      if (params.current) {
+        const data = await spotifyApi("/me/player/currently-playing") as any;
+        uri = data?.item?.uri;
+        if (!uri) throw new Error("No current track to unlike.");
+      }
+      const id = trackIdFromUriOrUrl(uri!);
+      await spotifyApi(`/me/tracks?ids=${encodeURIComponent(id)}`, { method: "DELETE" });
+      return { content: [{ type: "text", text: `Unliked track: spotify:track:${id}` }], details: { id, uri: `spotify:track:${id}` } };
     },
   });
 
