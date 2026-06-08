@@ -50,6 +50,7 @@ type AgentMessage = {
 
 let activeAgent: string | null = null;
 let activeLockPath: string | null = null;
+let recoveryTimer: NodeJS.Timeout | undefined;
 
 function validateAgentName(name: string, options: { allowPi?: boolean } = {}) {
   const trimmed = name.trim();
@@ -435,6 +436,27 @@ async function recoverAgentAsks(target: string) {
   return recovered;
 }
 
+async function recoverAllAgentAsks() {
+  const results: { agent: string; count: number }[] = [];
+  for (const agent of await listAgents()) {
+    const recovered = await recoverAgentAsks(agent).catch(() => []);
+    if (recovered.length) results.push({ agent, count: recovered.length });
+  }
+  return results;
+}
+
+function startRecoveryLoop(ctx: { ui: ExtensionCommandContext["ui"] }) {
+  if (recoveryTimer || IS_EPHEMERAL_CLONE) return;
+  recoveryTimer = setInterval(() => {
+    recoverAllAgentAsks()
+      .then((results) => {
+        if (!results.length) return;
+        ctx.ui.notify(`Recovered completed agent ask(s): ${results.map((r) => `${r.agent}:${r.count}`).join(", ")}`, "info");
+      })
+      .catch(() => undefined);
+  }, 5_000);
+}
+
 async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, targetRaw: string, body: string) {
   const target = sanitizeName(targetRaw);
   if (!(await exists(manifestPath(target)))) throw new Error(`Unknown agent: ${target}`);
@@ -693,6 +715,7 @@ function usage(ctx: ExtensionCommandContext, text: string) {
 
 export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
+    startRecoveryLoop(ctx as any);
     const name = currentAgentFromCwd(ctx.cwd);
     if (name) {
       try {
@@ -708,6 +731,8 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (recoveryTimer) clearInterval(recoveryTimer);
+    recoveryTimer = undefined;
     await releaseLock();
   });
 
@@ -880,26 +905,26 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     },
   });
 
+  function launchAgentAsk(args: string, ctx: ExtensionCommandContext, commandName: string) {
+    const parsed = parseTargetAndBody(args);
+    if (!parsed) return usage(ctx, `Usage: /${commandName} <agent> <question>`);
+    const [to, body] = parsed;
+    ctx.ui.notify(`Started read-only ${to} clone ask. I’ll notify when it finishes; /agent-ask-recover ${to} can recover retained answers if needed.`, "info");
+    runAgentAskClone(pi, ctx, to, body).catch((error) => {
+      ctx.ui.notify(`agent ask failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    });
+  }
+
   pi.registerCommand("agent-ask", {
     description: "Ask another agent via an ephemeral read-only clone",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (args, ctx) => {
-      const parsed = parseTargetAndBody(args);
-      if (!parsed) return usage(ctx, "Usage: /agent-ask <agent> <question>");
-      const [to, body] = parsed;
-      await runAgentAskClone(pi, ctx, to, body);
-    },
+    handler: async (args, ctx) => launchAgentAsk(args, ctx, "agent-ask"),
   });
 
   pi.registerCommand("agent-consult", {
     description: "Alias for /agent-ask",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (args, ctx) => {
-      const parsed = parseTargetAndBody(args);
-      if (!parsed) return usage(ctx, "Usage: /agent-consult <agent> <question>");
-      const [to, body] = parsed;
-      await runAgentAskClone(pi, ctx, to, body);
-    },
+    handler: async (args, ctx) => launchAgentAsk(args, ctx, "agent-consult"),
   });
 
   pi.registerCommand("agent-execute", {
