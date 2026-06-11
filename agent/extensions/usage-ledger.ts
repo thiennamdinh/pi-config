@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, extname, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
 const HOME = process.env.HOME ?? ".";
@@ -9,8 +9,31 @@ const AGENTS_ROOT = `${HOME}/.pi/agents`;
 const LEDGER_PATH = `${HOME}/.pi/agent/usage-ledger.jsonl`;
 const STATUS_KEY = "usage-ledger";
 
+type ResourceAccess = "read" | "write" | "execute" | "unknown";
+
+type UsageResource = {
+  path?: string;
+  language?: string;
+  kind?: string;
+  access: ResourceAccess;
+};
+
+type UsageToolCall = {
+  ordinal: number;
+  id?: string;
+  name: string;
+  signature: string;
+  argsShape?: string;
+  resources: UsageResource[];
+  languages: string[];
+  resultBytes?: number;
+  isError?: boolean;
+};
+
 type UsageLedgerRecord = {
-  ts: string;
+  timestamp: string;
+  /** Backward-compatible reader support only; new writes use timestamp. */
+  ts?: string;
   kind: "provider_response";
   agent: string;
   sessionFile?: string;
@@ -26,6 +49,7 @@ type UsageLedgerRecord = {
   model?: string;
   thinking?: string;
   tools?: string[];
+  toolCalls?: UsageToolCall[];
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -45,6 +69,8 @@ type Scope = {
 
 let currentTurnIndex: number | undefined;
 let currentTurnTools = new Set<string>();
+let currentToolOrdinal = 0;
+let currentTurnToolCalls = new Map<string, UsageToolCall>();
 let currentScope: Scope = {
   taskId: process.env.PI_USAGE_TASK,
   mode: process.env.PI_USAGE_MODE,
@@ -64,6 +90,10 @@ function currentAgentFromCwd(cwd: string) {
   return existsSync(`${AGENTS_ROOT}/${name}/manifest.json`) ? name : "pi";
 }
 
+function recordTimestamp(record: UsageLedgerRecord) {
+  return record.timestamp ?? record.ts ?? "";
+}
+
 function gitRoot(cwd: string): string | undefined {
   try {
     const out = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
@@ -71,6 +101,110 @@ function gitRoot(cwd: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function languageForPath(path: string): string {
+  const base = basename(path).toLowerCase();
+  const ext = extname(base);
+  if (["makefile", "dockerfile"].includes(base)) return base;
+  if (base === "agents.md" || base.endsWith(".md")) return "markdown";
+  const byExt: Record<string, string> = {
+    ".rs": "rust",
+    ".scm": "scheme",
+    ".ss": "scheme",
+    ".sld": "scheme",
+    ".lisp": "lisp",
+    ".el": "elisp",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".py": "python",
+    ".go": "go",
+    ".java": "java",
+    ".c": "c",
+    ".h": "c/c++",
+    ".cc": "c++",
+    ".cpp": "c++",
+    ".hpp": "c++",
+    ".md": "markdown",
+    ".txt": "text",
+    ".json": "json",
+    ".jsonl": "jsonl",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".sql": "sql",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "css",
+    ".xml": "xml",
+  };
+  return byExt[ext] ?? "unknown";
+}
+
+function resourceKind(language: string) {
+  if (["markdown", "text"].includes(language)) return "docs";
+  if (["json", "jsonl", "yaml", "toml", "xml"].includes(language)) return "config/data";
+  if (language === "unknown") return "unknown";
+  return "source";
+}
+
+function resourceForPath(path: string, access: ResourceAccess): UsageResource {
+  const language = languageForPath(path);
+  return { path, language, kind: resourceKind(language), access };
+}
+
+function resultByteSize(result: unknown) {
+  try {
+    return Buffer.byteLength(JSON.stringify(result ?? null), "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function commandSignature(command: string) {
+  const trimmed = command.trim();
+  if (!trimmed) return "bash:empty";
+  const first = trimmed.split(/\s+/)[0];
+  if (["rg", "grep", "fd", "find", "ls", "git", "npm", "pnpm", "yarn", "cargo", "go", "python", "python3", "node", "jq", "yq"].includes(first)) return `bash:${first}`;
+  return "bash:other";
+}
+
+function inferToolCall(event: { toolCallId?: string; toolName: string; args?: any }, ordinal: number): UsageToolCall {
+  const name = event.toolName;
+  const args = event.args ?? {};
+  const resources: UsageResource[] = [];
+  let signature = name;
+  let argsShape: string | undefined;
+
+  if (name === "read" && typeof args.path === "string") {
+    const resource = resourceForPath(args.path, "read");
+    resources.push(resource);
+    signature = `read:${resource.language ?? "unknown"}`;
+    argsShape = ["path", args.offset !== undefined ? "offset" : undefined, args.limit !== undefined ? "limit" : undefined].filter(Boolean).join("+");
+  } else if (name === "write" && typeof args.path === "string") {
+    const resource = resourceForPath(args.path, "write");
+    resources.push(resource);
+    signature = `write:${resource.language ?? "unknown"}`;
+    argsShape = "path+content";
+  } else if (name === "edit" && typeof args.path === "string") {
+    const resource = resourceForPath(args.path, "write");
+    resources.push(resource);
+    signature = `edit:${resource.language ?? "unknown"}`;
+    argsShape = "path+edits";
+  } else if (name === "bash" && typeof args.command === "string") {
+    signature = commandSignature(args.command);
+    argsShape = "command";
+  } else {
+    argsShape = Object.keys(args).sort().join("+") || undefined;
+  }
+
+  const languages = [...new Set(resources.map((r) => r.language).filter(Boolean) as string[])].sort();
+  return { ordinal, id: event.toolCallId, name, signature, argsShape, resources, languages };
 }
 
 function inferMode(ctx: ExtensionCommandContext): string {
@@ -158,7 +292,7 @@ function groupBy(records: UsageLedgerRecord[], key: keyof UsageLedgerRecord) {
 
 async function recordsSince(args: string) {
   const since = parseSince(args);
-  return (await readRecords()).filter((r) => Date.parse(r.ts) >= since);
+  return (await readRecords()).filter((r) => Date.parse(recordTimestamp(r)) >= since);
 }
 
 async function notifySummary(ctx: ExtensionCommandContext, args: string, group?: keyof UsageLedgerRecord) {
@@ -188,7 +322,7 @@ async function notifyTopTurns(ctx: ExtensionCommandContext, args: string) {
   if (!records.length) return ctx.ui.notify(`No usage ledger records in last ${sinceLabel}.`, "info");
   const lines = [`Top usage turns last ${sinceLabel}`];
   for (const r of records) {
-    const local = new Date(r.ts).toLocaleString();
+    const local = new Date(recordTimestamp(r)).toLocaleString();
     lines.push(`${local}  $${r.costTotal.toFixed(4)}  ${formatTokens(r.totalTokens)}  ${r.agent}/${r.mode}/${r.action}  ${r.model ?? "?"}  ${r.sessionFile ?? ""}`);
   }
   ctx.ui.notify(lines.join("\n"), "info");
@@ -197,7 +331,7 @@ async function notifyTopTurns(ctx: ExtensionCommandContext, args: string) {
 function updateStatus(ctx: ExtensionCommandContext) {
   readRecords()
     .then((records) => {
-      const day = records.filter((r) => Date.parse(r.ts) >= Date.now() - 24 * 60 * 60_000);
+      const day = records.filter((r) => Date.parse(recordTimestamp(r)) >= Date.now() - 24 * 60 * 60_000);
       const agg = aggregate(day);
       ctx.ui.setStatus(STATUS_KEY, day.length ? `usage 24h $${agg.cost.toFixed(2)} ${formatTokens(agg.total)}` : undefined);
     })
@@ -209,11 +343,24 @@ export default function usageLedger(pi: ExtensionAPI) {
 
   pi.on("turn_start", async (event) => {
     currentTurnIndex = event.turnIndex;
-    currentTurnTools = new Set<string>();
+    // Do not clear pending tool calls here: Pi may emit a provider response that
+    // requests tools, then tool_execution_* events, then another provider
+    // response with the final answer. We attach the executed tools to the final
+    // response record and clear them after writing that record.
+    if (!currentTurnTools.size && !currentTurnToolCalls.size) currentToolOrdinal = 0;
   });
 
   pi.on("tool_execution_start", async (event) => {
     currentTurnTools.add(event.toolName);
+    const ordinal = ++currentToolOrdinal;
+    currentTurnToolCalls.set(event.toolCallId, inferToolCall(event, ordinal));
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    const existing = currentTurnToolCalls.get(event.toolCallId) ?? inferToolCall(event, ++currentToolOrdinal);
+    existing.resultBytes = resultByteSize(event.result);
+    existing.isError = Boolean(event.isError);
+    currentTurnToolCalls.set(event.toolCallId, existing);
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -225,7 +372,7 @@ export default function usageLedger(pi: ExtensionAPI) {
     const context = ctx as ExtensionCommandContext;
     const modelId = context.model ? `${context.model.provider}/${context.model.id}` : undefined;
     const record: UsageLedgerRecord = {
-      ts: nowIso(),
+      timestamp: nowIso(),
       kind: "provider_response",
       agent: currentAgentFromCwd(context.cwd),
       sessionFile: context.sessionManager.getSessionFile(),
@@ -241,6 +388,7 @@ export default function usageLedger(pi: ExtensionAPI) {
       model: modelId,
       thinking: (context as any).thinkingLevel ?? undefined,
       tools,
+      toolCalls: [...currentTurnToolCalls.values()].sort((a, b) => a.ordinal - b.ordinal),
       inputTokens: usage.input || 0,
       outputTokens: usage.output || 0,
       cacheReadTokens: usage.cacheRead || 0,
@@ -253,6 +401,11 @@ export default function usageLedger(pi: ExtensionAPI) {
       costTotal: cost.total || 0,
     };
     await writeRecord(record);
+    if (currentTurnToolCalls.size) {
+      currentTurnTools = new Set<string>();
+      currentTurnToolCalls = new Map<string, UsageToolCall>();
+      currentToolOrdinal = 0;
+    }
     updateStatus(context);
   });
 
