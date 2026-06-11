@@ -9,6 +9,7 @@ agent/spotify-token.json
 agent/sessions/
 agent/rate-limits.json
 agent/scheduled-prompts.json
+agent/usage-ledger.jsonl
 agent/tmp/
 agents/
 # Local helper binaries/caches
