@@ -85,52 +85,24 @@ function updateStatus(ctx = activeContext): void {
     .catch(() => safeStatus(ctx, undefined));
 }
 
-function parseDelay(value: string): number | undefined {
-  const match = /^(\d+(?:\.\d+)?)(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)$/i.exec(value.trim());
-  if (!match) return undefined;
-  const amount = Number(match[1]);
-  if (!Number.isFinite(amount) || amount <= 0) return undefined;
-  const unit = match[2].toLowerCase();
-  if (unit.startsWith("s")) return amount * 1000;
-  if (unit.startsWith("m")) return amount * 60_000;
-  if (unit.startsWith("h")) return amount * 60 * 60_000;
-  return undefined;
-}
-
-function parseLocalTime(spec: string): number | undefined {
+function parsePromptTime(spec: string): number | undefined {
   const raw = spec.trim();
   const now = new Date();
 
-  const timeMatch = /^(\d{1,2})(?::(\d{2}))?\s*([ap]m)?$/i.exec(raw);
-  if (timeMatch) {
-    let hour = Number(timeMatch[1]);
-    const minute = timeMatch[2] === undefined ? 0 : Number(timeMatch[2]);
-    const ampm = timeMatch[3]?.toLowerCase();
-    if (minute < 0 || minute > 59) return undefined;
-    if (ampm) {
-      if (hour < 1 || hour > 12) return undefined;
-      if (ampm === "pm" && hour !== 12) hour += 12;
-      if (ampm === "am" && hour === 12) hour = 0;
-    } else if (hour > 23) {
-      return undefined;
-    }
+  const timeOnly = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
+  if (timeOnly) {
+    const hour = Number(timeOnly[1]);
+    const minute = Number(timeOnly[2]);
+    const second = timeOnly[3] === undefined ? 0 : Number(timeOnly[3]);
+    if (hour > 23 || minute > 59 || second > 59) return undefined;
     const due = new Date(now);
-    due.setHours(hour, minute, 0, 0);
+    due.setHours(hour, minute, second, 0);
     if (due.getTime() <= now.getTime()) due.setDate(due.getDate() + 1);
     return due.getTime();
   }
 
-  const dateTime = /^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})(?:\s*([ap]m))?$/i.exec(raw);
-  if (dateTime) {
-    const parsed = parseLocalTime(`${dateTime[2]}${dateTime[3] ? ` ${dateTime[3]}` : ""}`);
-    if (!parsed) return undefined;
-    const date = new Date(`${dateTime[1]}T00:00:00`);
-    if (Number.isNaN(date.getTime())) return undefined;
-    const time = new Date(parsed);
-    date.setHours(time.getHours(), time.getMinutes(), 0, 0);
-    return date.getTime();
-  }
-
+  const isoLocal = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/.exec(raw);
+  if (!isoLocal) return undefined;
   const absolute = Date.parse(raw);
   return Number.isNaN(absolute) ? undefined : absolute;
 }
@@ -142,17 +114,6 @@ function splitFirstArg(args: string): [string, string] | undefined {
   if (!match) return undefined;
   const spec = match[1].replace(/^(["'])(.*)\1$/, "$2");
   return [spec, match[2].trim()];
-}
-
-function splitPromptAtArgs(args: string): [string, string] | undefined {
-  const first = splitFirstArg(args);
-  if (!first) return undefined;
-  const [maybeDate, rest] = first;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(maybeDate)) {
-    const second = splitFirstArg(rest);
-    if (second) return [`${maybeDate} ${second[0]}`, second[1]];
-  }
-  return first;
 }
 
 function makeId(): string {
@@ -247,39 +208,19 @@ export default function scheduledPrompts(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("prompt-later", {
-    description: "Schedule a prompt in this session after a delay, e.g. /prompt-later 10m Continue.",
+    description: "Schedule a prompt in this session at a time, e.g. /prompt-later 13:05 Continue.",
     handler: async (args, ctx) => {
       activeContext = ctx;
       activePi = pi;
       const parsed = splitFirstArg(args);
       if (!parsed) {
-        safeNotify(ctx, "Usage: /prompt-later <10m|30s|2h> <prompt>", "warning");
-        return;
-      }
-      const [delaySpec, prompt] = parsed;
-      const delay = parseDelay(delaySpec);
-      if (!delay) {
-        safeNotify(ctx, "Delay must look like 30s, 10m, or 2h.", "warning");
-        return;
-      }
-      await schedulePrompt(pi, ctx, Date.now() + delay, prompt);
-    },
-  });
-
-  pi.registerCommand("prompt-at", {
-    description: "Schedule a prompt at a local time, e.g. /prompt-at 23:15 Continue.",
-    handler: async (args, ctx) => {
-      activeContext = ctx;
-      activePi = pi;
-      const parsed = splitPromptAtArgs(args);
-      if (!parsed) {
-        safeNotify(ctx, "Usage: /prompt-at <HH:MM|9:30pm|YYYY-MM-DD HH:MM> <prompt>", "warning");
+        safeNotify(ctx, "Usage: /prompt-later <HH:MM|HH:MM:SS|YYYY-MM-DDTHH:MM[:SS]> <prompt>", "warning");
         return;
       }
       const [timeSpec, prompt] = parsed;
-      const dueAt = parseLocalTime(timeSpec);
+      const dueAt = parsePromptTime(timeSpec);
       if (!dueAt) {
-        safeNotify(ctx, "Time must look like 23:15, 9:30pm, or 2026-06-07 23:15.", "warning");
+        safeNotify(ctx, "Time must look like 13:05, 13:05:33, or 2026-06-11T13:05:33.", "warning");
         return;
       }
       await schedulePrompt(pi, ctx, dueAt, prompt);
