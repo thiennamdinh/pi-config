@@ -34,7 +34,7 @@ type UsageLedgerRecord = {
   timestamp: string;
   /** Backward-compatible reader support only; new writes use timestamp. */
   ts?: string;
-  kind: "provider_response";
+  kind: "provider_response" | "compaction" | "compaction_lookahead";
   agent: string;
   sessionFile?: string;
   messageId?: string;
@@ -50,16 +50,24 @@ type UsageLedgerRecord = {
   thinking?: string;
   tools?: string[];
   toolCalls?: UsageToolCall[];
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  totalTokens: number;
-  costInput: number;
-  costOutput: number;
-  costCacheRead: number;
-  costCacheWrite: number;
-  costTotal: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+  costInput?: number;
+  costOutput?: number;
+  costCacheRead?: number;
+  costCacheWrite?: number;
+  costTotal?: number;
+  compactionEntryId?: string;
+  firstKeptEntryId?: string;
+  tokensBefore?: number;
+  tokensAfterEstimate?: number;
+  summaryChars?: number;
+  summaryTokenEstimate?: number;
+  fromExtension?: boolean;
+  durationMs?: number;
 };
 
 type Scope = {
@@ -75,6 +83,7 @@ let currentScope: Scope = {
   taskId: process.env.PI_USAGE_TASK,
   mode: process.env.PI_USAGE_MODE,
 };
+let compactionStartedAt: number | undefined;
 
 function nowIso() {
   return new Date().toISOString();
@@ -308,7 +317,7 @@ async function notifySummary(ctx: ExtensionCommandContext, args: string, group?:
     lines.push("", `By ${group}:`);
     for (const [label, agg] of groupBy(records, group).slice(0, 20)) lines.push(aggregateLine(label, agg));
   } else {
-    for (const key of ["agent", "mode", "action", "taskId", "model"] as (keyof UsageLedgerRecord)[]) {
+    for (const key of ["kind", "agent", "mode", "action", "taskId", "model"] as (keyof UsageLedgerRecord)[]) {
       lines.push("", `By ${key}:`);
       for (const [label, agg] of groupBy(records, key).slice(0, 8)) lines.push(aggregateLine(label, agg));
     }
@@ -323,7 +332,7 @@ async function notifyTopTurns(ctx: ExtensionCommandContext, args: string) {
   const lines = [`Top usage turns last ${sinceLabel}`];
   for (const r of records) {
     const local = new Date(recordTimestamp(r)).toLocaleString();
-    lines.push(`${local}  $${r.costTotal.toFixed(4)}  ${formatTokens(r.totalTokens)}  ${r.agent}/${r.mode}/${r.action}  ${r.model ?? "?"}  ${r.sessionFile ?? ""}`);
+    lines.push(`${local}  $${(r.costTotal || 0).toFixed(4)}  ${formatTokens(r.totalTokens || 0)}  ${r.agent}/${r.mode}/${r.action}  ${r.model ?? "?"}  ${r.sessionFile ?? ""}`);
   }
   ctx.ui.notify(lines.join("\n"), "info");
 }
@@ -348,6 +357,54 @@ export default function usageLedger(pi: ExtensionAPI) {
     // response with the final answer. We attach the executed tools to the final
     // response record and clear them after writing that record.
     if (!currentTurnTools.size && !currentTurnToolCalls.size) currentToolOrdinal = 0;
+  });
+
+  pi.on("session_before_compact", async () => {
+    compactionStartedAt = Date.now();
+  });
+
+  pi.on("session_compact", async (event, ctx) => {
+    const context = ctx as ExtensionCommandContext;
+    const entry = event.compactionEntry as any;
+    const contextUsage = context.getContextUsage?.();
+    const summary = String(entry.summary ?? "");
+    const record: UsageLedgerRecord = {
+      timestamp: nowIso(),
+      kind: "compaction",
+      agent: currentAgentFromCwd(context.cwd),
+      sessionFile: context.sessionManager.getSessionFile(),
+      mode: inferMode(context),
+      action: event.fromExtension ? "extension-compaction" : "compaction",
+      taskId: currentScope.taskId ?? process.env.PI_USAGE_TASK,
+      cwd: context.cwd,
+      gitRoot: gitRoot(context.cwd),
+      provider: context.model?.provider,
+      model: context.model ? `${context.model.provider}/${context.model.id}` : undefined,
+      thinking: (context as any).thinkingLevel ?? undefined,
+      tools: [],
+      toolCalls: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+      costInput: 0,
+      costOutput: 0,
+      costCacheRead: 0,
+      costCacheWrite: 0,
+      costTotal: 0,
+      compactionEntryId: entry.id,
+      firstKeptEntryId: entry.firstKeptEntryId,
+      tokensBefore: entry.tokensBefore,
+      tokensAfterEstimate: contextUsage?.tokens,
+      summaryChars: summary.length,
+      summaryTokenEstimate: Math.ceil(summary.length / 4),
+      fromExtension: Boolean(event.fromExtension ?? entry.fromHook),
+      durationMs: compactionStartedAt ? Date.now() - compactionStartedAt : undefined,
+    };
+    compactionStartedAt = undefined;
+    await writeRecord(record);
+    updateStatus(context);
   });
 
   pi.on("tool_execution_start", async (event) => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -35,6 +35,7 @@ const CUSTOM_DETAILS = { source: "compaction-lookahead", version: 1 };
 const BOOTSTRAP_MARGIN_TOKENS = 12000;
 const MIN_BOOTSTRAP_TOKENS_TO_SUMMARIZE = 8000;
 const READY_STATUS_MS = 45_000;
+const USAGE_LEDGER_PATH = `${process.env.HOME ?? "."}/.pi/agent/usage-ledger.jsonl`;
 const DURABLE_SUMMARY_INSTRUCTIONS = `Produce a durable named-agent memory checkpoint, not a terse chat recap.
 
 Favor fidelity over brevity when information may matter in future sessions. Preserve:
@@ -93,6 +94,51 @@ function sameSettings(a: CompactionSettings, b: CompactionSettings): boolean {
 
 function estimateMessagesTokens(messages: AgentMessage[]): number {
   return messages.reduce((total, message) => total + estimateTokens(message), 0);
+}
+
+function currentAgentFromCwd(cwd: string): string {
+  const agentsRoot = `${process.env.HOME ?? "."}/.pi/agents`;
+  const root = `${agentsRoot}/`;
+  if (!cwd.startsWith(root)) return "pi";
+  const name = cwd.slice(root.length).split("/")[0];
+  return name || "pi";
+}
+
+function appendLookaheadUsage(ctx: ExtensionContext, data: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(USAGE_LEDGER_PATH), { recursive: true });
+    appendFileSync(
+      USAGE_LEDGER_PATH,
+      `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        kind: "compaction_lookahead",
+        agent: currentAgentFromCwd(ctx.cwd),
+        sessionFile: ctx.sessionManager.getSessionFile(),
+        mode: process.env.PI_USAGE_MODE ?? (ctx.hasUI ? "interactive" : "noninteractive"),
+        action: "compaction-lookahead",
+        taskId: process.env.PI_USAGE_TASK,
+        cwd: ctx.cwd,
+        provider: ctx.model?.provider,
+        model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+        tools: [],
+        toolCalls: [],
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+        costInput: 0,
+        costOutput: 0,
+        costCacheRead: 0,
+        costCacheWrite: 0,
+        costTotal: 0,
+        ...data,
+      })}\n`,
+      "utf8",
+    );
+  } catch {
+    // Usage tracking must not make lookahead fragile.
+  }
 }
 
 function safeNotify(ctx: ExtensionContext, message: string, level: "info" | "warning" = "info"): void {
@@ -183,6 +229,7 @@ async function computeLookaheadThroughEntry(
   inFlight.add(key);
 
   safeSetStatus(ctx, `summarizing… (${reason})`);
+  const startedAt = Date.now();
 
   try {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -218,6 +265,16 @@ async function computeLookaheadThroughEntry(
       settings,
       model: `${model.provider}/${model.id}`,
     });
+    appendLookaheadUsage(ctx, {
+      action: "compaction-lookahead-post",
+      sourceCompactionId,
+      coveredEntryId,
+      tokensBeforeEstimate: estimate,
+      summaryChars: summary.length,
+      summaryTokenEstimate: Math.ceil(summary.length / 4),
+      durationMs: Date.now() - startedAt,
+      model: `${model.provider}/${model.id}`,
+    });
     safeNotify(ctx, "Compaction lookahead: next summary is ready.", "info");
     safeSetStatus(ctx, "ready");
     clearStatusLater(ctx, READY_STATUS_MS);
@@ -236,6 +293,7 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
   inFlight.add(key);
 
   safeSetStatus(ctx, "summarizing… (bootstrap)");
+  const startedAt = Date.now();
 
   try {
     const sessionId = ctx.sessionManager.getSessionId();
@@ -269,6 +327,15 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       firstKeptEntryId: result.firstKeptEntryId,
       tokensBeforeEstimate: result.tokensBefore,
       settings,
+      model: `${model.provider}/${model.id}`,
+    });
+    appendLookaheadUsage(ctx, {
+      action: "compaction-lookahead-bootstrap",
+      firstKeptEntryId: result.firstKeptEntryId,
+      tokensBeforeEstimate: result.tokensBefore,
+      summaryChars: result.summary.length,
+      summaryTokenEstimate: Math.ceil(result.summary.length / 4),
+      durationMs: Date.now() - startedAt,
       model: `${model.provider}/${model.id}`,
     });
     safeNotify(ctx, "Compaction lookahead: first compaction summary is ready.", "info");
