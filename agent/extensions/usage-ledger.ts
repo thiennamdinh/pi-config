@@ -361,9 +361,18 @@ type ToolAggregate = {
   errors: number;
 };
 
+function parseLimit(args: string, defaultLimit = 16) {
+  const raw = args.trim().split(/\s+/)[1];
+  if (!raw) return defaultLimit;
+  if (raw.toLowerCase() === "all") return Number.POSITIVE_INFINITY;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 200) : defaultLimit;
+}
+
 async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
   const records = (await recordsSince(args)).filter((r) => r.kind === "provider_response" && (r.toolCalls?.length ?? 0) > 0);
   const sinceLabel = args.trim().split(/\s+/)[0] || "24h";
+  const limit = parseLimit(args);
   if (!records.length) return ctx.ui.notify(`No tool-call usage records in last ${sinceLabel}.`, "info");
 
   const groups = new Map<string, ToolAggregate>();
@@ -386,8 +395,9 @@ async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
     }
   }
 
-  const rows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost).slice(0, 20);
-  const lines = [`Top tools last ${sinceLabel}`, "tool                   calls turns       tok        cost   result   errors"];
+  const rows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost).slice(0, limit);
+  const limitLabel = Number.isFinite(limit) ? `top ${limit}` : "all";
+  const lines = [`Top tools last ${sinceLabel} (${limitLabel})`, "tool                   calls turns       tok        cost   result   errors"];
   for (const [tool, agg] of rows) {
     lines.push(`${tool.padEnd(22)} ${String(agg.calls).padStart(5)} ${String(agg.turns.size).padStart(5)} ${formatTokens(agg.tokens).padStart(9)} $${agg.cost.toFixed(4).padStart(9)} ${formatBytes(agg.resultBytes).padStart(8)} ${String(agg.errors).padStart(6)}`);
   }
@@ -555,7 +565,7 @@ export default function usageLedger(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("usage-by-tool", {
-    description: "Group usage by tool call. Usage: /usage-by-tool [24h|3d|7d]",
+    description: "Group usage by tool call. Usage: /usage-by-tool [24h|3d|7d] [limit|all]",
     handler: async (args, ctx) => notifyByTool(ctx, args),
   });
 
