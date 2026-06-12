@@ -345,6 +345,56 @@ async function notifyTopTurns(ctx: ExtensionCommandContext, args: string) {
   ctx.ui.notify(lines.join("\n"), "info");
 }
 
+function formatBytes(n: number) {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}GB`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}KB`;
+  return `${Math.round(n)}B`;
+}
+
+type ToolAggregate = {
+  calls: number;
+  turns: Set<string>;
+  cost: number;
+  tokens: number;
+  resultBytes: number;
+  errors: number;
+};
+
+async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
+  const records = (await recordsSince(args)).filter((r) => r.kind === "provider_response" && (r.toolCalls?.length ?? 0) > 0);
+  const sinceLabel = args.trim().split(/\s+/)[0] || "24h";
+  if (!records.length) return ctx.ui.notify(`No tool-call usage records in last ${sinceLabel}.`, "info");
+
+  const groups = new Map<string, ToolAggregate>();
+  for (const record of records) {
+    const calls = record.toolCalls ?? [];
+    if (!calls.length) continue;
+    const turnKey = record.messageId ?? `${recordTimestamp(record)}:${record.sessionFile ?? ""}`;
+    const attributedCost = (record.costTotal ?? 0) / calls.length;
+    const attributedTokens = (record.totalTokens ?? 0) / calls.length;
+    for (const call of calls) {
+      const key = call.name;
+      const agg = groups.get(key) ?? { calls: 0, turns: new Set<string>(), cost: 0, tokens: 0, resultBytes: 0, errors: 0 };
+      agg.calls += 1;
+      agg.turns.add(turnKey);
+      agg.cost += attributedCost;
+      agg.tokens += attributedTokens;
+      agg.resultBytes += call.resultBytes ?? 0;
+      if (call.isError) agg.errors += 1;
+      groups.set(key, agg);
+    }
+  }
+
+  const rows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost).slice(0, 20);
+  const lines = [`Top tools last ${sinceLabel}`, "tool                   calls turns       tok        cost   result   errors"];
+  for (const [tool, agg] of rows) {
+    lines.push(`${tool.padEnd(22)} ${String(agg.calls).padStart(5)} ${String(agg.turns.size).padStart(5)} ${formatTokens(agg.tokens).padStart(9)} $${agg.cost.toFixed(4).padStart(9)} ${formatBytes(agg.resultBytes).padStart(8)} ${String(agg.errors).padStart(6)}`);
+  }
+  lines.push("", "Cost/tokens are attributed evenly across tool calls in each turn; use as a pattern signal, not exact per-tool billing.");
+  ctx.ui.notify(lines.join("\n"), "info");
+}
+
 function updateStatus(ctx: ExtensionCommandContext) {
   readRecords()
     .then((records) => {
@@ -502,6 +552,11 @@ export default function usageLedger(pi: ExtensionAPI) {
   pi.registerCommand("usage-top-turns", {
     description: "Show the most expensive turns. Usage: /usage-top-turns [24h|3d|7d]",
     handler: async (args, ctx) => notifyTopTurns(ctx, args),
+  });
+
+  pi.registerCommand("usage-by-tool", {
+    description: "Group usage by tool call. Usage: /usage-by-tool [24h|3d|7d]",
+    handler: async (args, ctx) => notifyByTool(ctx, args),
   });
 
   pi.registerCommand("usage-task", {
