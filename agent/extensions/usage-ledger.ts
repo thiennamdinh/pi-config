@@ -60,6 +60,7 @@ type UsageLedgerRecord = {
   costCacheRead?: number;
   costCacheWrite?: number;
   costTotal?: number;
+  estimatedCost?: boolean;
   compactionEntryId?: string;
   firstKeptEntryId?: string;
   tokensBefore?: number;
@@ -288,6 +289,13 @@ function aggregateLine(label: string, a: Aggregate) {
   return `${label.padEnd(24)} ${String(a.count).padStart(5)} turns  ${formatTokens(a.total).padStart(8)} tok  $${a.cost.toFixed(4).padStart(10)}  in ${formatTokens(a.input)} out ${formatTokens(a.output)} cache ${formatTokens(a.cacheRead)}`;
 }
 
+function estimateCost(model: any, inputTokens: number, outputTokens: number) {
+  const cost = model?.cost ?? {};
+  const input = (inputTokens * (cost.input ?? 0)) / 1_000_000;
+  const output = (outputTokens * (cost.output ?? 0)) / 1_000_000;
+  return { input, output, total: input + output };
+}
+
 function groupBy(records: UsageLedgerRecord[], key: keyof UsageLedgerRecord) {
   const groups = new Map<string, UsageLedgerRecord[]>();
   for (const record of records) {
@@ -368,6 +376,10 @@ export default function usageLedger(pi: ExtensionAPI) {
     const entry = event.compactionEntry as any;
     const contextUsage = context.getContextUsage?.();
     const summary = String(entry.summary ?? "");
+    const usedLookaheadCache = entry.details?.source === "compaction-lookahead";
+    const inputTokens = usedLookaheadCache ? 0 : entry.tokensBefore ?? 0;
+    const outputTokens = usedLookaheadCache ? 0 : Math.ceil(summary.length / 4);
+    const estimatedCost = estimateCost(context.model, inputTokens, outputTokens);
     const record: UsageLedgerRecord = {
       timestamp: nowIso(),
       kind: "compaction",
@@ -383,16 +395,17 @@ export default function usageLedger(pi: ExtensionAPI) {
       thinking: (context as any).thinkingLevel ?? undefined,
       tools: [],
       toolCalls: [],
-      inputTokens: 0,
-      outputTokens: 0,
+      inputTokens,
+      outputTokens,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
-      totalTokens: 0,
-      costInput: 0,
-      costOutput: 0,
+      totalTokens: inputTokens + outputTokens,
+      costInput: estimatedCost.input,
+      costOutput: estimatedCost.output,
       costCacheRead: 0,
       costCacheWrite: 0,
-      costTotal: 0,
+      costTotal: estimatedCost.total,
+      estimatedCost: true,
       compactionEntryId: entry.id,
       firstKeptEntryId: entry.firstKeptEntryId,
       tokensBefore: entry.tokensBefore,

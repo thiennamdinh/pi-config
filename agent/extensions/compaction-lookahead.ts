@@ -104,6 +104,13 @@ function currentAgentFromCwd(cwd: string): string {
   return name || "pi";
 }
 
+function estimateCost(model: any, inputTokens: number, outputTokens: number) {
+  const cost = model?.cost ?? {};
+  const input = (inputTokens * (cost.input ?? 0)) / 1_000_000;
+  const output = (outputTokens * (cost.output ?? 0)) / 1_000_000;
+  return { input, output, total: input + output };
+}
+
 function appendLookaheadUsage(ctx: ExtensionContext, data: Record<string, unknown>): void {
   try {
     mkdirSync(dirname(USAGE_LEDGER_PATH), { recursive: true });
@@ -132,6 +139,7 @@ function appendLookaheadUsage(ctx: ExtensionContext, data: Record<string, unknow
         costCacheRead: 0,
         costCacheWrite: 0,
         costTotal: 0,
+        estimatedCost: true,
         ...data,
       })}\n`,
       "utf8",
@@ -265,13 +273,21 @@ async function computeLookaheadThroughEntry(
       settings,
       model: `${model.provider}/${model.id}`,
     });
+    const outputTokens = Math.ceil(summary.length / 4);
+    const estimatedCost = estimateCost(model, estimate, outputTokens);
     appendLookaheadUsage(ctx, {
       action: "compaction-lookahead-post",
       sourceCompactionId,
       coveredEntryId,
       tokensBeforeEstimate: estimate,
       summaryChars: summary.length,
-      summaryTokenEstimate: Math.ceil(summary.length / 4),
+      summaryTokenEstimate: outputTokens,
+      inputTokens: estimate,
+      outputTokens,
+      totalTokens: estimate + outputTokens,
+      costInput: estimatedCost.input,
+      costOutput: estimatedCost.output,
+      costTotal: estimatedCost.total,
       durationMs: Date.now() - startedAt,
       model: `${model.provider}/${model.id}`,
     });
@@ -329,12 +345,20 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       settings,
       model: `${model.provider}/${model.id}`,
     });
+    const outputTokens = Math.ceil(result.summary.length / 4);
+    const estimatedCost = estimateCost(model, result.tokensBefore, outputTokens);
     appendLookaheadUsage(ctx, {
       action: "compaction-lookahead-bootstrap",
       firstKeptEntryId: result.firstKeptEntryId,
       tokensBeforeEstimate: result.tokensBefore,
       summaryChars: result.summary.length,
-      summaryTokenEstimate: Math.ceil(result.summary.length / 4),
+      summaryTokenEstimate: outputTokens,
+      inputTokens: result.tokensBefore,
+      outputTokens,
+      totalTokens: result.tokensBefore + outputTokens,
+      costInput: estimatedCost.input,
+      costOutput: estimatedCost.output,
+      costTotal: estimatedCost.total,
       durationMs: Date.now() - startedAt,
       model: `${model.provider}/${model.id}`,
     });
