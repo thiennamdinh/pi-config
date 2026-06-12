@@ -890,37 +890,6 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("agent-task", {
-    description: "Append a queued user task to another agent without running it",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (args, ctx) => {
-      const [to, ...bodyParts] = args.trim().split(/\s+/);
-      const body = bodyParts.join(" ").trim();
-      if (!to || !body) return usage(ctx, "Usage: /agent-task <agent> <message>");
-      const from = await currentAgent(ctx);
-      if (to === "pi") {
-        ctx.ui.notify("Ephemeral pi has no durable task queue; run the task in the current ephemeral session or clone it into a named agent.", "warning");
-        return;
-      }
-      const msg = await appendAgentMessage(to, { type: "task", from, body });
-      ctx.ui.notify(`Queued task ${msg.id} for ${to}`, "info");
-    },
-  });
-
-  pi.registerCommand("agent-tell", {
-    description: "Append an inbox message for another agent without running it",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (args, ctx) => {
-      const [to, ...bodyParts] = args.trim().split(/\s+/);
-      const body = bodyParts.join(" ").trim();
-      if (!to || !body) return usage(ctx, "Usage: /agent-tell <agent> <message>");
-      if (to === "pi") return usage(ctx, "Ephemeral pi has no durable inbox.");
-      const from = await currentAgent(ctx);
-      const msg = await appendAgentMessage(to, { type: "tell", from, body, status: "queued" });
-      ctx.ui.notify(`Queued tell ${msg.id} for ${to}.`, "info");
-    },
-  });
-
   async function launchAgentAsk(args: string, ctx: ExtensionCommandContext, commandName: string) {
     const parsed = parseTargetAndBody(args);
     if (!parsed) return usage(ctx, `Usage: /${commandName} <agent> <question>`);
@@ -965,14 +934,6 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     description: "Alias for /agent-ask",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => launchAgentAsk(args, ctx, "agent-consult"),
-  });
-
-  pi.registerCommand("agent-execute", {
-    description: "Deprecated live run-now command (disabled until live IPC exists)",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
-    handler: async (_args, ctx) => {
-      ctx.ui.notify("/agent-execute is disabled until live-agent IPC exists. Use /agent-task, /agent-tell, or /agent-ask clone consultations.", "warning");
-    },
   });
 
   pi.registerCommand("agent-ask-recover", {
