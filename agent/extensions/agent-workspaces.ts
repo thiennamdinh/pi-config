@@ -1014,6 +1014,37 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "agent_send_message",
+    label: "Agent Send Message",
+    description: "Send a short durable inbox message to another persistent Pi agent.",
+    promptSnippet: "Use agent_send_message to pass concise context, handoff notes, or side-channel updates to another named Pi agent.",
+    promptGuidelines: [
+      "Use agent_send_message when the user asks you to notify, pass context to, or hand off information to another named agent.",
+      "Keep messages concise and durable; do not include secrets unless the user explicitly asks.",
+      "Use agent_list first if you need to discover available agent names.",
+    ],
+    parameters: Type.Object({
+      to: Type.String({ description: "Target persistent agent name." }),
+      body: Type.String({ description: "Message body to place in the target agent's inbox." }),
+      type: Type.Optional(Type.String({ description: "Message type, usually 'tell' or 'task'. Defaults to 'tell'." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const to = sanitizeTargetName(params.to);
+      if (to === "pi") throw new Error("Ephemeral pi has no durable inbox; send messages to a named persistent agent.");
+      const body = params.body.trim();
+      if (!body) throw new Error("Message body is required.");
+      const requestedType = (params.type ?? "tell").trim();
+      const type: MessageType = requestedType === "task" ? "task" : "tell";
+      const from = currentAgentFromCwd(ctx?.cwd ?? "") ?? activeAgent ?? "pi";
+      const msg = await appendAgentMessage(to, { type, from, body, status: "queued" });
+      return {
+        content: [{ type: "text", text: `Sent ${type} message ${msg.id} to ${to}.` }],
+        details: { id: msg.id, to, from, type },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "agent_list",
     label: "Agent List",
     description: "List persistent named Pi agents.",
