@@ -361,18 +361,26 @@ type ToolAggregate = {
   errors: number;
 };
 
-function parseLimit(args: string, defaultLimit = 16) {
-  const raw = args.trim().split(/\s+/)[1];
-  if (!raw) return defaultLimit;
-  if (raw.toLowerCase() === "all") return Number.POSITIVE_INFINITY;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? Math.min(n, 200) : defaultLimit;
+function parseToolUsageArgs(args: string, defaultLimit = 16) {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  let sinceLabel = "24h";
+  let limit = defaultLimit;
+  for (const part of parts) {
+    if (/^\d+(?:\.\d+)?[mhdw]$/i.test(part)) {
+      sinceLabel = part;
+    } else if (part.toLowerCase() === "all") {
+      limit = Number.POSITIVE_INFINITY;
+    } else {
+      const n = Number.parseInt(part, 10);
+      if (Number.isFinite(n) && n > 0) limit = Math.min(n, 200);
+    }
+  }
+  return { sinceLabel, since: parseSince(sinceLabel), limit };
 }
 
 async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
-  const records = (await recordsSince(args)).filter((r) => r.kind === "provider_response" && (r.toolCalls?.length ?? 0) > 0);
-  const sinceLabel = args.trim().split(/\s+/)[0] || "24h";
-  const limit = parseLimit(args);
+  const { sinceLabel, since, limit } = parseToolUsageArgs(args);
+  const records = (await readRecords()).filter((r) => Date.parse(recordTimestamp(r)) >= since && r.kind === "provider_response" && (r.toolCalls?.length ?? 0) > 0);
   if (!records.length) return ctx.ui.notify(`No tool-call usage records in last ${sinceLabel}.`, "info");
 
   const groups = new Map<string, ToolAggregate>();
@@ -395,8 +403,9 @@ async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
     }
   }
 
-  const rows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost).slice(0, limit);
-  const limitLabel = Number.isFinite(limit) ? `top ${limit}` : "all";
+  const allRows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost);
+  const rows = allRows.slice(0, limit);
+  const limitLabel = Number.isFinite(limit) ? `showing ${rows.length} of ${allRows.length}, cap ${limit}` : `showing all ${allRows.length}`;
   const lines = [`Top tools last ${sinceLabel} (${limitLabel})`, "tool                   calls turns       tok        cost   result   errors"];
   for (const [tool, agg] of rows) {
     lines.push(`${tool.padEnd(22)} ${String(agg.calls).padStart(5)} ${String(agg.turns.size).padStart(5)} ${formatTokens(agg.tokens).padStart(9)} $${agg.cost.toFixed(4).padStart(9)} ${formatBytes(agg.resultBytes).padStart(8)} ${String(agg.errors).padStart(6)}`);
