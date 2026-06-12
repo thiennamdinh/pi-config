@@ -49,6 +49,8 @@ type AgentMessage = {
 let activeAgent: string | null = null;
 let activeLockPath: string | null = null;
 let recoveryTimer: NodeJS.Timeout | undefined;
+let inboxNoticeTimer: NodeJS.Timeout | undefined;
+const notifiedInboxMessageIds = new Map<string, Set<string>>();
 
 function validateAgentName(name: string, options: { allowPi?: boolean } = {}) {
   const trimmed = name.trim();
@@ -242,6 +244,8 @@ async function switchToPi(ctx: ExtensionCommandContext, note?: string, runPrompt
   allowNextManagedSwitchToPi = true;
   await ctx.switchSession(sessionFile, {
     withSession: async (next: ReplacedSessionContext) => {
+      if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
+      inboxNoticeTimer = undefined;
       next.ui.notify(note ?? "Switched to ephemeral agent pi", "info");
       next.ui.setStatus?.("agent-workspace", "agent:pi");
       if (runPrompt) {
@@ -261,6 +265,7 @@ async function switchToAgent(pi: ExtensionAPI, name: string, ctx: ExtensionComma
     withSession: async (next: ReplacedSessionContext) => {
       next.ui.notify(note ?? `Switched to agent ${name}`, "info");
       await applyManifest(pi, name, next);
+      startInboxNoticeLoop(name, next as any);
       if (runPrompt) {
         await next.sendUserMessage(runPrompt);
         await next.waitForIdle();
@@ -662,6 +667,38 @@ async function markMessageAbsorbed(name: string, id: string) {
   return updateAgentMessage(name, id, { status: "absorbed", absorbedAt: nowIso() });
 }
 
+function shouldNotifyInboxMessage(agent: string, msg: AgentMessage) {
+  if (msg.from === agent) return false;
+  if (msg.status === "absorbed" || msg.status === "failed") return false;
+  return msg.status === "queued" || msg.status === "processing" || msg.status === "done";
+}
+
+async function notifyNewInboxMessages(name: string, ctx: ExtensionCommandContext) {
+  const seen = notifiedInboxMessageIds.get(name) ?? new Set<string>();
+  notifiedInboxMessageIds.set(name, seen);
+  const messages = await readAgentMessages(name);
+  const senders = new Set<string>();
+  for (const msg of messages) {
+    if (seen.has(msg.id)) continue;
+    seen.add(msg.id);
+    if (shouldNotifyInboxMessage(name, msg)) senders.add(msg.from);
+  }
+  for (const sender of [...senders].sort()) {
+    ctx.ui.notify(`New agent message from ${sender}.`, "info");
+  }
+}
+
+function startInboxNoticeLoop(name: string, ctx: ExtensionCommandContext) {
+  if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
+  inboxNoticeTimer = undefined;
+  if (IS_EPHEMERAL_CLONE) return;
+  const tick = () => {
+    notifyNewInboxMessages(name, ctx).catch(() => undefined);
+  };
+  tick();
+  inboxNoticeTimer = setInterval(tick, 5000);
+}
+
 async function agentInstructions(name: string) {
   const dir = agentDir(name);
   const chunks: string[] = [];
@@ -697,6 +734,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       try {
         if (!IS_EPHEMERAL_CLONE) await acquireLock(name, ctx);
         await applyManifest(pi, name, ctx as any);
+        startInboxNoticeLoop(name, ctx as ExtensionCommandContext);
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
         ctx.shutdown();
@@ -709,6 +747,8 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (recoveryTimer) clearInterval(recoveryTimer);
     recoveryTimer = undefined;
+    if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
+    inboxNoticeTimer = undefined;
     await releaseLock();
   });
 
@@ -968,6 +1008,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       const ok = await markMessageAbsorbed(name, id);
       if (!ok) return ctx.ui.notify(`No message ${id} in ${name}'s inbox.`, "warning");
       await appendAgentMessage(name, { type: "event", from: name, body: `absorbed ${id}`, replyTo: id, status: "absorbed", absorbedAt: nowIso() } as any);
+      notifiedInboxMessageIds.get(name)?.add(id);
       ctx.ui.notify(`Marked ${id} absorbed for ${name}.`, "info");
     },
   });
