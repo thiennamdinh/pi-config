@@ -365,21 +365,27 @@ function parseToolUsageArgs(args: string, defaultLimit = 16) {
   const parts = args.trim().split(/\s+/).filter(Boolean);
   let sinceLabel = "24h";
   let limit = defaultLimit;
+  let group: "signature" | "tool" = "signature";
   for (const part of parts) {
+    const lower = part.toLowerCase();
     if (/^\d+(?:\.\d+)?[mhdw]$/i.test(part)) {
       sinceLabel = part;
-    } else if (part.toLowerCase() === "all") {
+    } else if (lower === "all") {
       limit = Number.POSITIVE_INFINITY;
+    } else if (["tool", "tools", "name", "names"].includes(lower)) {
+      group = "tool";
+    } else if (["signature", "signatures", "sig", "sigs"].includes(lower)) {
+      group = "signature";
     } else {
       const n = Number.parseInt(part, 10);
       if (Number.isFinite(n) && n > 0) limit = Math.min(n, 200);
     }
   }
-  return { sinceLabel, since: parseSince(sinceLabel), limit };
+  return { sinceLabel, since: parseSince(sinceLabel), limit, group };
 }
 
 async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
-  const { sinceLabel, since, limit } = parseToolUsageArgs(args);
+  const { sinceLabel, since, limit, group } = parseToolUsageArgs(args);
   const records = (await readRecords()).filter((r) => Date.parse(recordTimestamp(r)) >= since && r.kind === "provider_response" && (r.toolCalls?.length ?? 0) > 0);
   if (!records.length) return ctx.ui.notify(`No tool-call usage records in last ${sinceLabel}.`, "info");
 
@@ -391,7 +397,7 @@ async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
     const attributedCost = (record.costTotal ?? 0) / calls.length;
     const attributedTokens = (record.totalTokens ?? 0) / calls.length;
     for (const call of calls) {
-      const key = call.name;
+      const key = group === "signature" ? call.signature : call.name;
       const agg = groups.get(key) ?? { calls: 0, turns: new Set<string>(), cost: 0, tokens: 0, resultBytes: 0, errors: 0 };
       agg.calls += 1;
       agg.turns.add(turnKey);
@@ -406,9 +412,10 @@ async function notifyByTool(ctx: ExtensionCommandContext, args: string) {
   const allRows = [...groups.entries()].sort((a, b) => b[1].cost - a[1].cost);
   const rows = allRows.slice(0, limit);
   const limitLabel = Number.isFinite(limit) ? `showing ${rows.length} of ${allRows.length}, cap ${limit}` : `showing all ${allRows.length}`;
-  const lines = [`Top tools last ${sinceLabel} (${limitLabel})`, "tool                   calls turns       tok        cost   result   errors"];
+  const label = group === "signature" ? "signature" : "tool";
+  const lines = [`Top tool ${label}s last ${sinceLabel} (${limitLabel})`, `${label.padEnd(28)} calls turns       tok        cost   result   errors`];
   for (const [tool, agg] of rows) {
-    lines.push(`${tool.padEnd(22)} ${String(agg.calls).padStart(5)} ${String(agg.turns.size).padStart(5)} ${formatTokens(agg.tokens).padStart(9)} $${agg.cost.toFixed(4).padStart(9)} ${formatBytes(agg.resultBytes).padStart(8)} ${String(agg.errors).padStart(6)}`);
+    lines.push(`${tool.padEnd(28)} ${String(agg.calls).padStart(5)} ${String(agg.turns.size).padStart(5)} ${formatTokens(agg.tokens).padStart(9)} $${agg.cost.toFixed(4).padStart(9)} ${formatBytes(agg.resultBytes).padStart(8)} ${String(agg.errors).padStart(6)}`);
   }
   lines.push("", "Cost/tokens are attributed evenly across tool calls in each turn; use as a pattern signal, not exact per-tool billing.");
   ctx.ui.notify(lines.join("\n"), "info");
@@ -574,7 +581,7 @@ export default function usageLedger(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("usage-by-tool", {
-    description: "Group usage by tool call. Usage: /usage-by-tool [24h|3d|7d] [limit|all]",
+    description: "Group usage by tool signature by default. Usage: /usage-by-tool [24h|3d|7d] [limit|all] [signature|tool]",
     handler: async (args, ctx) => notifyByTool(ctx, args),
   });
 
