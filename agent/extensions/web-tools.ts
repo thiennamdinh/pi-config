@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { spawnSync } from "node:child_process";
 import { Type } from "typebox";
 
 type BraveWebResult = {
@@ -10,6 +11,36 @@ type BraveWebResult = {
   language?: string;
   family_friendly?: boolean;
 };
+
+const PROFILE_FILES = ["~/.profile", "~/.bash_profile", "~/.bashrc"];
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function refreshProfileEnvVar(name: string) {
+  const sourceCommands = PROFILE_FILES.map((file) => `f=${shellQuote(file)}; f=\${f/#~/$HOME}; [ -r "$f" ] && . "$f" >/dev/null 2>/dev/null || true`).join("; ");
+  const marker = `__PI_WEB_ENV_${process.pid}_${Date.now()}__`;
+  const script = `${sourceCommands}; printf '${marker}\\0'; env -0`;
+  const result = spawnSync("bash", ["-lc", script], {
+    encoding: "buffer",
+    env: { ...process.env },
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) return process.env[name];
+
+  const markerBuffer = Buffer.from(`${marker}\0`);
+  const start = result.stdout.indexOf(markerBuffer);
+  if (start < 0) return process.env[name];
+  const envBytes = result.stdout.subarray(start + markerBuffer.length);
+  for (const entry of envBytes.toString("utf8").split("\0")) {
+    if (!entry.startsWith(`${name}=`)) continue;
+    const value = entry.slice(name.length + 1);
+    if (value) process.env[name] = value;
+    return value || process.env[name];
+  }
+  return process.env[name];
+}
 
 function htmlToText(html: string): string {
   return html
@@ -51,9 +82,9 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal) {
-      const apiKey = process.env.BRAVE_SEARCH_API_KEY_PI;
+      const apiKey = refreshProfileEnvVar("BRAVE_SEARCH_API_KEY_PI");
       if (!apiKey) {
-        throw new Error("BRAVE_SEARCH_API_KEY_PI is not set in the pi process environment. Restart pi after sourcing ~/.profile.");
+        throw new Error("BRAVE_SEARCH_API_KEY_PI is not set in the pi process environment or shell profile.");
       }
 
       const count = Math.max(1, Math.min(20, Math.floor(params.count ?? 5)));
