@@ -727,17 +727,8 @@ function usage(ctx: ExtensionCommandContext, text: string) {
 }
 
 export default function agentWorkspaces(pi: ExtensionAPI) {
-  pi.registerFlag("agent", {
-    description: "Start in a persistent named agent workspace",
-    type: "string",
-  });
-
   pi.on("session_start", async (_event, ctx) => {
     startRecoveryLoop(ctx as any);
-    const requestedAgent = pi.getFlag("agent");
-    if (typeof requestedAgent === "string" && requestedAgent.trim()) {
-      ctx.ui.notify("--agent must be handled by ~/.pi/agent/bin/pi before Pi starts; check that wrapper is first on PATH.", "warning");
-    }
     const name = currentAgentFromCwd(ctx.cwd);
     if (name) {
       try {
