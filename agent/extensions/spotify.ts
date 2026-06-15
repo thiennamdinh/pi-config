@@ -1,13 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 
 const HOME = process.env.HOME ?? ".";
 const TOKEN_PATH = `${HOME}/.pi/agent/spotify-token.json`;
 const MUSIC_MEMORY_PATH = `${HOME}/.pi/agent/memory/music.md`;
+const MUSIC_FEEDBACK_LOG_PATH = `${HOME}/.pi/agent/memory/music-feedback.jsonl`;
 const DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback";
 const SCOPES = [
   "user-read-playback-state",
@@ -219,6 +220,43 @@ function summarizeTrack(track: any) {
   return `${track.name}${artists ? ` — ${artists}` : ""}${album}\n${track.uri}\n${track.external_urls?.spotify ?? ""}`;
 }
 
+async function getCurrentTrack() {
+  const data = await spotifyApi("/me/player/currently-playing") as any;
+  const track = data?.item;
+  if (!track?.uri) throw new Error("No current Spotify track found.");
+  return { data, track };
+}
+
+async function setTrackLiked(uri: string, liked: boolean) {
+  const id = trackIdFromUriOrUrl(uri);
+  await spotifyApi(`/me/tracks?ids=${encodeURIComponent(id)}`, { method: liked ? "PUT" : "DELETE" });
+  return `spotify:track:${id}`;
+}
+
+async function appendMusicFeedback(action: "like" | "unlike", track: any, note?: string) {
+  await mkdir(dirname(MUSIC_FEEDBACK_LOG_PATH), { recursive: true });
+  const entry = {
+    timestamp: new Date().toISOString(),
+    action,
+    note: note?.trim() || undefined,
+    track: {
+      name: track.name,
+      artists: track.artists?.map((a: any) => a.name) ?? [],
+      album: track.album?.name,
+      uri: track.uri,
+      url: track.external_urls?.spotify,
+    },
+  };
+  await appendFile(MUSIC_FEEDBACK_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+async function likeOrUnlikeCurrentTrack(action: "like" | "unlike", note?: string) {
+  const { track } = await getCurrentTrack();
+  const uri = await setTrackLiked(track.uri, action === "like");
+  await appendMusicFeedback(action, track, note);
+  return { track, uri };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("spotify-auth-url", {
     description: "Print the Spotify authorization URL for first-time setup",
@@ -243,6 +281,22 @@ export default function (pi: ExtensionAPI) {
       }
       await exchangeCode(code);
       ctx.ui.notify(`Spotify token saved to ${TOKEN_PATH}`, "info");
+    },
+  });
+
+  pi.registerCommand("spotify-like", {
+    description: "Like the current Spotify track and log lightweight music feedback",
+    handler: async (args, ctx) => {
+      const { track } = await likeOrUnlikeCurrentTrack("like", args);
+      ctx.ui.notify(`Liked and logged: ${track.name} — ${track.artists?.map((a: any) => a.name).join(", ")}`, "info");
+    },
+  });
+
+  pi.registerCommand("spotify-unlike", {
+    description: "Unlike the current Spotify track and log lightweight music feedback",
+    handler: async (args, ctx) => {
+      const { track } = await likeOrUnlikeCurrentTrack("unlike", args);
+      ctx.ui.notify(`Unliked and logged: ${track.name} — ${track.artists?.map((a: any) => a.name).join(", ")}`, "info");
     },
   });
 
@@ -507,15 +561,13 @@ export default function (pi: ExtensionAPI) {
       current: Type.Optional(Type.Boolean({ description: "Like the currently playing track." })),
     }),
     async execute(_id, params) {
-      let uri = params.current ? undefined : await resolveTrackUri(params);
       if (params.current) {
-        const data = await spotifyApi("/me/player/currently-playing") as any;
-        uri = data?.item?.uri;
-        if (!uri) throw new Error("No current track to like.");
+        const { track, uri } = await likeOrUnlikeCurrentTrack("like");
+        return { content: [{ type: "text", text: `Liked current track:\n${summarizeTrack(track)}` }], details: { uri, track } };
       }
-      const id = trackIdFromUriOrUrl(uri!);
-      await spotifyApi(`/me/tracks?ids=${encodeURIComponent(id)}`, { method: "PUT" });
-      return { content: [{ type: "text", text: `Liked track: spotify:track:${id}` }], details: { id, uri: `spotify:track:${id}` } };
+      const uri = await resolveTrackUri(params);
+      const likedUri = await setTrackLiked(uri, true);
+      return { content: [{ type: "text", text: `Liked track: ${likedUri}` }], details: { uri: likedUri } };
     },
   });
 
@@ -530,15 +582,13 @@ export default function (pi: ExtensionAPI) {
       current: Type.Optional(Type.Boolean({ description: "Unlike the currently playing track." })),
     }),
     async execute(_id, params) {
-      let uri = params.current ? undefined : await resolveTrackUri(params);
       if (params.current) {
-        const data = await spotifyApi("/me/player/currently-playing") as any;
-        uri = data?.item?.uri;
-        if (!uri) throw new Error("No current track to unlike.");
+        const { track, uri } = await likeOrUnlikeCurrentTrack("unlike");
+        return { content: [{ type: "text", text: `Unliked current track:\n${summarizeTrack(track)}` }], details: { uri, track } };
       }
-      const id = trackIdFromUriOrUrl(uri!);
-      await spotifyApi(`/me/tracks?ids=${encodeURIComponent(id)}`, { method: "DELETE" });
-      return { content: [{ type: "text", text: `Unliked track: spotify:track:${id}` }], details: { id, uri: `spotify:track:${id}` } };
+      const uri = await resolveTrackUri(params);
+      const likedUri = await setTrackLiked(uri, false);
+      return { content: [{ type: "text", text: `Unliked track: ${likedUri}` }], details: { uri: likedUri } };
     },
   });
 
@@ -569,6 +619,24 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: `Queued: ${selected ? summarizeItem(selected, 0) : uri}` }],
         details: { uri, selected },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "music_feedback_log_read",
+    label: "Music Feedback Log Read",
+    description: "Read recent lightweight Spotify like/unlike feedback logged by user commands.",
+    promptSnippet: "Read recent lightweight music feedback from Spotify like/unlike commands.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Number({ description: "Number of recent feedback entries to return." })),
+    }),
+    async execute(_id, params) {
+      if (!existsSync(MUSIC_FEEDBACK_LOG_PATH)) return { content: [{ type: "text", text: "No music feedback logged yet." }], details: { path: MUSIC_FEEDBACK_LOG_PATH, entries: [] } };
+      const limit = Math.max(1, Math.min(200, Math.floor(params.limit ?? 50)));
+      const lines = (await readFile(MUSIC_FEEDBACK_LOG_PATH, "utf8")).trim().split("\n").filter(Boolean);
+      const entries = lines.slice(-limit).map((line) => JSON.parse(line));
+      const text = entries.map((entry: any) => `${entry.timestamp} ${entry.action}: ${entry.track?.name} — ${(entry.track?.artists ?? []).join(", ")}${entry.note ? ` (${entry.note})` : ""}`).join("\n");
+      return { content: [{ type: "text", text: text || "No music feedback logged yet." }], details: { path: MUSIC_FEEDBACK_LOG_PATH, entries } };
     },
   });
 
