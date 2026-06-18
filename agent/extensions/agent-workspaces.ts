@@ -974,6 +974,48 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "agent_ask",
+    label: "Agent Ask",
+    description: "Ask another persistent Pi agent via an ephemeral read-only clone and return its answer.",
+    promptSnippet: "Use agent_ask when you need an immediate answer from another named agent via a read-only clone.",
+    promptGuidelines: [
+      "Use agent_ask for synchronous consultation with another named agent when the user asks you to ask/consult/get input from that agent.",
+      "Use agent_send_message for durable notes that do not need an immediate answer.",
+      "Consultation runs in an ephemeral clone and does not mutate the target agent's main session.",
+      "Use agent_list first if you need to discover available agent names.",
+    ],
+    parameters: Type.Object({
+      to: Type.String({ description: "Target persistent agent name." }),
+      question: Type.String({ description: "Question or task for the target agent clone." }),
+      timeoutMs: Type.Optional(Type.Number({ description: "Maximum time to wait for an answer in milliseconds. Default 180000." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const to = sanitizeName(params.to);
+      const question = params.question.trim();
+      if (!question) throw new Error("Question is required.");
+      const timeoutMs = Math.max(1000, Math.min(params.timeoutMs ?? 180_000, 600_000));
+      const started = await runAgentAskClone(pi, ctx as any, to, question);
+      if (started.status === "failed") {
+        return {
+          content: [{ type: "text", text: `Failed to start ${to} consultation clone. Artifact: ${started.artifactPath}` }],
+          details: started,
+        };
+      }
+      const answer = await waitForAskAnswer(to, started.request, timeoutMs);
+      if (!answer) {
+        return {
+          content: [{ type: "text", text: `${to} has not answered yet. Artifact: ${started.artifactPath}` }],
+          details: { ...started, timedOut: true },
+        };
+      }
+      return {
+        content: [{ type: "text", text: answer }],
+        details: { ...started, answer },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "agent_send_message",
     label: "Agent Send Message",
     description: "Send a short durable inbox message to another persistent Pi agent.",
@@ -994,7 +1036,10 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       const body = params.body.trim();
       if (!body) throw new Error("Message body is required.");
       const requestedType = (params.type ?? "tell").trim();
-      const type: MessageType = requestedType === "task" ? "task" : "tell";
+      if (requestedType !== "tell" && requestedType !== "task") {
+        throw new Error(`Unsupported message type: ${requestedType}. Use agent_ask for immediate consultations.`);
+      }
+      const type: MessageType = requestedType;
       const from = currentAgentFromCwd(ctx?.cwd ?? "") ?? activeAgent ?? "pi";
       const msg = await appendAgentMessage(to, { type, from, body, status: "queued" });
       return {
