@@ -885,8 +885,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       await mkdir(TRASH_ROOT, { recursive: true });
       await releaseLock();
       await rename(agentDir(name), dest);
-      ctx.ui.notify(`Moved agent ${name} to ${dest}`, "info");
-      await ctx.newSession();
+      await switchToPi(ctx, `Moved agent ${name} to ${dest}`);
     },
   });
 
