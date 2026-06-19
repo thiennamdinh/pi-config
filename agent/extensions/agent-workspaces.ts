@@ -851,7 +851,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
           await writeManifest(manifest);
         }
       }
-      await switchToAgent(pi, newName, ctx, `Cloned current session to agent ${newName}`);
+      ctx.ui.notify(`Cloned current session to agent ${newName}. Open or switch to it explicitly when ready.`, "info");
     },
   });
 
