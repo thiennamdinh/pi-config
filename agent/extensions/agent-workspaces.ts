@@ -14,6 +14,10 @@ const EPHEMERAL_PI_SESSION_DIR = join(HOME, ".pi", "agent", "tmp", "pi-ephemeral
 const EXT_CUSTOM_TYPE = "agent-workspaces";
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const IS_EPHEMERAL_CLONE = Boolean(process.env.PI_AGENT_EPHEMERAL_CLONE);
+const IS_REFLECTION = Boolean(process.env.PI_AGENT_REFLECTION);
+const REFLECTION_TARGET = process.env.PI_AGENT_REFLECTION_TARGET;
+const DEFAULT_MEMORY_BUDGET_TOKENS = 25_000;
+const DEFAULT_REFLECTION_AFTER_COMPACTIONS = 8;
 
 let allowNextManagedSwitchToPi = false;
 
@@ -27,6 +31,11 @@ type Manifest = {
   cwdPolicy: "agent-home";
   sessionFile?: string;
   maxRuntimeSeconds?: number;
+  memoryBudgetTokens?: number;
+  memoryReflection?: {
+    enabled?: boolean;
+    afterCompactions?: number;
+  };
 };
 
 type MessageType = "tell" | "ask" | "ask_request" | "task" | "execute" | "answer" | "ask_answer" | "event";
@@ -50,6 +59,7 @@ let activeAgent: string | null = null;
 let activeLockPath: string | null = null;
 let recoveryTimer: NodeJS.Timeout | undefined;
 let inboxNoticeTimer: NodeJS.Timeout | undefined;
+const reflectionWatchTimers = new Map<string, NodeJS.Timeout>();
 const notifiedInboxMessageIds = new Map<string, Set<string>>();
 
 function validateAgentName(name: string, options: { allowPi?: boolean } = {}) {
@@ -80,6 +90,14 @@ function manifestPath(name: string) {
 
 function sessionDir(name: string) {
   return join(agentDir(name), "session");
+}
+
+function memoryDir(name: string) {
+  return join(agentDir(name), "memory");
+}
+
+function reflectionStatePath(name: string) {
+  return join(memoryDir(name), ".reflection-state.json");
 }
 
 function messagesPath(name: string) {
@@ -192,6 +210,7 @@ async function createAgentWorkspace(name: string, description = "") {
   if (await exists(dir)) throw new Error(`Agent already exists: ${name}`);
 
   await mkdir(join(dir, "memory"), { recursive: true });
+  await mkdir(join(dir, "notebook"), { recursive: true });
   await mkdir(join(dir, ".pi", "skills"), { recursive: true });
   await mkdir(sessionDir(name), { recursive: true });
   await mkdir(join(dir, "artifacts"), { recursive: true });
@@ -283,7 +302,8 @@ async function applyManifest(pi: ExtensionAPI, name: string, ctx: { modelRegistr
     else ctx.ui.notify(`Agent ${name}: model not found: ${manifest.model}`, "warning");
   }
   if (manifest.thinkingLevel) pi.setThinkingLevel(manifest.thinkingLevel as any);
-  if (manifest.tools) pi.setActiveTools(manifest.tools);
+  if (IS_REFLECTION) pi.setActiveTools(["read", "grep", "find", "ls", "edit", "write"]);
+  else if (manifest.tools) pi.setActiveTools(manifest.tools);
   ctx.ui.setStatus?.("agent-workspace", `agent:${name}`);
 }
 
@@ -324,6 +344,77 @@ function preview(text: string, max = 1200) {
 
 function markdownEscapeFence(text: string) {
   return text.replace(/```/g, "`\\`\\`");
+}
+
+function estimateTokens(text: string) {
+  return Math.ceil(text.length / 4);
+}
+
+function memoryBudgetTokens(manifest: Manifest) {
+  return manifest.memoryBudgetTokens && manifest.memoryBudgetTokens > 0 ? Math.floor(manifest.memoryBudgetTokens) : DEFAULT_MEMORY_BUDGET_TOKENS;
+}
+
+function memoryBand(budget: number) {
+  return { lower: Math.floor(budget * 0.75), upper: Math.ceil(budget * 1.25) };
+}
+
+function memoryReflectionAfterCompactions(manifest: Manifest) {
+  return manifest.memoryReflection?.afterCompactions && manifest.memoryReflection.afterCompactions > 0
+    ? Math.floor(manifest.memoryReflection.afterCompactions)
+    : DEFAULT_REFLECTION_AFTER_COMPACTIONS;
+}
+
+function memoryReflectionEnabled(manifest: Manifest) {
+  return manifest.memoryReflection?.enabled ?? true;
+}
+
+async function injectedMemoryFiles(name: string) {
+  const { readdir } = await import("node:fs/promises");
+  const dir = memoryDir(name);
+  if (!(await exists(dir))) return [] as { path: string; relativePath: string; text: string; tokens: number }[];
+  const files = (await readdir(dir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+    .map((entry) => entry.name)
+    .sort();
+  const out = [] as { path: string; relativePath: string; text: string; tokens: number }[];
+  for (const file of files) {
+    const path = join(dir, file);
+    const text = await readFile(path, "utf8");
+    out.push({ path, relativePath: `memory/${file}`, text, tokens: estimateTokens(text) });
+  }
+  return out;
+}
+
+async function memoryStatus(name: string) {
+  const manifest = await readManifest(name);
+  const files = await injectedMemoryFiles(name);
+  const tokens = files.reduce((sum, file) => sum + file.tokens, 0);
+  const budget = memoryBudgetTokens(manifest);
+  const band = memoryBand(budget);
+  const state = tokens < band.lower ? "below" : tokens > band.upper ? "above" : "within";
+  return { name, files, tokens, budget, band, state };
+}
+
+function formatMemoryStatus(status: Awaited<ReturnType<typeof memoryStatus>>) {
+  const fileLines = status.files.length
+    ? status.files.map((file) => `- ${file.relativePath}: ~${file.tokens} tokens`).join("\n")
+    : "- no injected memory files";
+  return `Agent memory status: ${status.name}\n\nInjected memory: ~${status.tokens} tokens\nTarget: ${status.budget} tokens\nBand: ${status.band.lower}–${status.band.upper} tokens\nState: ${status.state}\n\nFiles:\n${fileLines}`;
+}
+
+async function snapshotMemory(name: string) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const src = memoryDir(name);
+  const dest = join(src, ".snapshots", stamp);
+  await mkdir(dest, { recursive: true });
+  if (await exists(src)) {
+    const { readdir } = await import("node:fs/promises");
+    for (const entry of await readdir(src, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      await cp(join(src, entry.name), join(dest, entry.name), { force: true });
+    }
+  }
+  return dest;
 }
 
 function parseTargetAndBody(args: string): [string, string] | undefined {
@@ -381,6 +472,168 @@ Rules:
 
 Caller request:
 ${body}`;
+}
+
+async function buildReflectionPrompt(target: string, budget: number) {
+  const templatePath = join(HOME, ".pi", "prompts", "agent-memory-reflection.md");
+  const template = await readFile(templatePath, "utf8");
+  return template
+    .replaceAll("{agent_name}", target)
+    .replaceAll("{agent_dir}", agentDir(target))
+    .replaceAll("{memory_budget_tokens}", String(budget));
+}
+
+async function startReflection(targetRaw: string, sourceSessionFile?: string) {
+  const target = sanitizeName(targetRaw);
+  if (!(await exists(manifestPath(target)))) throw new Error(`Unknown agent: ${target}`);
+  const manifest = await readManifest(target);
+  const budget = memoryBudgetTokens(manifest);
+  const before = await memoryStatus(target);
+  const snapshotPath = await snapshotMemory(target);
+  const reflectionId = makeId("reflect");
+  const reflectionSessionDir = join(sessionDir(target), "reflections", reflectionId);
+  await mkdir(reflectionSessionDir, { recursive: true });
+  const systemPrompt = await buildReflectionPrompt(target, budget);
+  const systemPromptPath = join(reflectionSessionDir, "reflection-system.md");
+  await writeFile(systemPromptPath, systemPrompt);
+  const userPrompt = "Perform memory reflection now. Edit the target agent memory as needed according to the reflection-mode system instructions, then stop.";
+  const model = manifest.model ? ["--model", manifest.model] : [];
+  const thinking = manifest.thinkingLevel ? ["--thinking", manifest.thinkingLevel] : [];
+  const fork = sourceSessionFile ? ["--fork", sourceSessionFile] : [];
+  const args = [
+    "-p",
+    "--session-dir",
+    reflectionSessionDir,
+    ...fork,
+    "--append-system-prompt",
+    systemPromptPath,
+    "--tools",
+    "read,grep,find,ls,edit,write",
+    ...model,
+    ...thinking,
+    userPrompt,
+  ];
+  const stdoutPath = join(reflectionSessionDir, "stdout.log");
+  const stderrPath = join(reflectionSessionDir, "stderr.log");
+  const jobPath = join(reflectionSessionDir, "job.json");
+  await writeJson(jobPath, { target, reflectionId, cwd: agentDir(target), args, sourceSessionFile, budget, before, snapshotPath, systemPromptPath, userPrompt, stdoutPath, stderrPath, startedAt: nowIso() });
+
+  let stdoutFd: number | undefined;
+  let stderrFd: number | undefined;
+  try {
+    stdoutFd = openSync(stdoutPath, "a");
+    stderrFd = openSync(stderrPath, "a");
+    const child = spawn("pi", args, {
+      cwd: agentDir(target),
+      env: { ...process.env, PI_AGENT_REFLECTION: "1", PI_AGENT_REFLECTION_TARGET: target, PI_AGENT_REFLECTION_ID: reflectionId },
+      detached: true,
+      stdio: ["ignore", stdoutFd, stderrFd],
+    });
+    child.unref();
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
+    stdoutFd = undefined;
+    stderrFd = undefined;
+    return { target, reflectionId, reflectionSessionDir, snapshotPath, before, pid: child.pid, stdoutPath, stderrPath, jobPath };
+  } catch (err) {
+    if (stdoutFd !== undefined) closeSync(stdoutFd);
+    if (stderrFd !== undefined) closeSync(stderrFd);
+    throw err;
+  }
+}
+
+async function updateReflectionState(name: string, patch: Record<string, unknown>) {
+  const path = reflectionStatePath(name);
+  let current: Record<string, unknown> = {};
+  if (await exists(path)) {
+    try {
+      current = JSON.parse(await readFile(path, "utf8"));
+    } catch {
+      current = {};
+    }
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify({ ...current, ...patch }, null, 2)}\n`);
+}
+
+async function readReflectionState(name: string) {
+  const path = reflectionStatePath(name);
+  if (!(await exists(path))) return {} as Record<string, any>;
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as Record<string, any>;
+  } catch {
+    return {} as Record<string, any>;
+  }
+}
+
+function reflectionStartedSummary(result: Awaited<ReturnType<typeof startReflection>>) {
+  return [
+    `Started ${result.target} memory reflection in the background.`,
+    `Before: ~${result.before.tokens} tokens (${result.before.state})`,
+    `Target band: ${result.before.band.lower}–${result.before.band.upper} tokens`,
+    `Snapshot: ${result.snapshotPath}`,
+    `Session/logs: ${result.reflectionSessionDir}`,
+    result.pid ? `pid: ${result.pid}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function pidIsAlive(pid: number | undefined) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
+}
+
+async function fileSize(path: string) {
+  try {
+    const { stat } = await import("node:fs/promises");
+    return (await stat(path)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflection>>, ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error" | "success"): void } }) {
+  if (!result.pid) return;
+  const key = `${result.target}:${result.reflectionId}`;
+  const existing = reflectionWatchTimers.get(key);
+  if (existing) clearInterval(existing);
+  let checks = 0;
+  const timer = setInterval(() => {
+    checks += 1;
+    if (pidIsAlive(result.pid) && checks < 720) return; // up to roughly one hour at 5s intervals
+    clearInterval(timer);
+    reflectionWatchTimers.delete(key);
+    (async () => {
+      const after = await memoryStatus(result.target);
+      const stderrBytes = await fileSize(result.stderrPath);
+      await updateReflectionState(result.target, {
+        lastReflectionCompletedAt: nowIso(),
+        lastReflectionSessionDir: result.reflectionSessionDir,
+        lastReflectionPid: result.pid,
+        lastReflectionBeforeTokens: result.before.tokens,
+        lastReflectionAfterTokens: after.tokens,
+        lastReflectionStderrBytes: stderrBytes,
+      });
+      const timedOut = checks >= 720 && pidIsAlive(result.pid);
+      const lines = [
+        timedOut ? `Reflection watcher timed out for ${result.target}; process may still be running.` : `Reflection complete for ${result.target}.`,
+        `Memory: ~${result.before.tokens} → ~${after.tokens} tokens (${after.state})`,
+        `Target band: ${after.band.lower}–${after.band.upper} tokens`,
+        `Session/logs: ${result.reflectionSessionDir}`,
+        stderrBytes ? `stderr has ${stderrBytes} bytes; inspect logs if behavior looks wrong.` : undefined,
+      ].filter(Boolean).join("\n");
+      ctx.ui.notify(lines, timedOut || stderrBytes ? "warning" : "info");
+    })().catch((err) => {
+      ctx.ui.notify(`Reflection completion check failed for ${result.target}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+    });
+  }, 5000);
+  reflectionWatchTimers.set(key, timer);
 }
 
 async function finalizeRecoveredAsk(target: string, request: AgentMessage, answer: string, note = "recovered") {
@@ -691,7 +944,7 @@ async function notifyNewInboxMessages(name: string, ctx: ExtensionCommandContext
 function startInboxNoticeLoop(name: string, ctx: ExtensionCommandContext) {
   if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
   inboxNoticeTimer = undefined;
-  if (IS_EPHEMERAL_CLONE) return;
+  if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
   const tick = () => {
     notifyNewInboxMessages(name, ctx).catch(() => undefined);
   };
@@ -705,13 +958,8 @@ async function agentInstructions(name: string) {
   const ag = join(dir, "AGENTS.md");
   if (await exists(ag)) chunks.push(`## Agent-local AGENTS.md\n\n${await readFile(ag, "utf8")}`);
 
-  const memDir = join(dir, "memory");
-  if (await exists(memDir)) {
-    const { readdir } = await import("node:fs/promises");
-    for (const file of (await readdir(memDir)).sort()) {
-      if (!file.endsWith(".md")) continue;
-      chunks.push(`## Agent memory: ${file}\n\n${await readFile(join(memDir, file), "utf8")}`);
-    }
+  for (const file of await injectedMemoryFiles(name)) {
+    chunks.push(`## Agent memory: ${file.relativePath}\n\n${file.text}`);
   }
 
   const messages = await queuedMessages(name);
@@ -726,14 +974,56 @@ function usage(ctx: ExtensionCommandContext, text: string) {
   ctx.ui.notify(text, "warning");
 }
 
+function isPathInside(path: string, root: string) {
+  const resolvedPath = resolve(path);
+  const resolvedRoot = resolve(root);
+  return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}/`);
+}
+
+function resolveToolPath(path: string, cwd: string) {
+  return resolve(path.startsWith("/") ? path : join(cwd, path));
+}
+
+function reflectionGuard(event: any, ctx: { cwd: string }) {
+  if (!IS_REFLECTION) return undefined;
+  const target = REFLECTION_TARGET ? sanitizeName(REFLECTION_TARGET) : currentAgentFromCwd(ctx.cwd);
+  if (!target) return { block: true, reason: "Reflection mode requires PI_AGENT_REFLECTION_TARGET or an agent cwd." };
+  const root = agentDir(target);
+  const writable = memoryDir(target);
+  const block = (reason: string) => ({ block: true, reason });
+  const allowed = new Set(["read", "grep", "find", "ls", "edit", "write"]);
+  if (!allowed.has(event.toolName)) return block(`Reflection mode blocks tool: ${event.toolName}.`);
+  if (event.toolName === "read" || event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") {
+    const path = typeof event.input?.path === "string" ? event.input.path : ".";
+    const resolved = resolveToolPath(path, ctx.cwd);
+    if (!isPathInside(resolved, root)) return block(`Reflection may read only under ${root}.`);
+    if (isPathInside(resolved, join(sessionDir(target), "reflections"))) return block("Reflection may not read reflection session logs.");
+    if (isPathInside(resolved, join(memoryDir(target), ".snapshots"))) return block("Reflection may not read memory snapshots.");
+  }
+  if (event.toolName === "write" || event.toolName === "edit") {
+    const path = event.input?.path;
+    if (typeof path !== "string") return block("Reflection write/edit path is missing.");
+    const resolved = resolveToolPath(path, ctx.cwd);
+    if (!isPathInside(resolved, writable)) return block(`Reflection may write only under ${writable}.`);
+    if (resolved.includes(`${resolve(join(writable, ".snapshots"))}/`)) return block("Reflection may not edit memory snapshots.");
+  }
+  return undefined;
+}
+
 export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     startRecoveryLoop(ctx as any);
     const name = currentAgentFromCwd(ctx.cwd);
     if (name) {
       try {
-        if (!IS_EPHEMERAL_CLONE) await acquireLock(name, ctx);
+        if (!IS_EPHEMERAL_CLONE && !IS_REFLECTION) await acquireLock(name, ctx);
         await applyManifest(pi, name, ctx as any);
+        if (!IS_REFLECTION) {
+          const status = await memoryStatus(name).catch(() => undefined);
+          if (status && status.state !== "within") {
+            ctx.ui.notify(`Agent ${name} memory is ${status.state} target band: ~${status.tokens} tokens, band ${status.band.lower}–${status.band.upper}. Use /agent-memory-status for details.`, status.state === "above" ? "warning" : "info");
+          }
+        }
         startInboxNoticeLoop(name, ctx as ExtensionCommandContext);
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
@@ -745,11 +1035,49 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (IS_REFLECTION && REFLECTION_TARGET) {
+      const target = sanitizeName(REFLECTION_TARGET);
+      const after = await memoryStatus(target).catch(() => undefined);
+      await updateReflectionState(target, {
+        lastReflectionCompletedAt: nowIso(),
+        lastReflectionId: process.env.PI_AGENT_REFLECTION_ID,
+        lastReflectionAfterTokens: after?.tokens,
+        lastReflectionAfterState: after?.state,
+      }).catch(() => undefined);
+    }
     if (recoveryTimer) clearInterval(recoveryTimer);
     recoveryTimer = undefined;
     if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
     inboxNoticeTimer = undefined;
+    for (const timer of reflectionWatchTimers.values()) clearInterval(timer);
+    reflectionWatchTimers.clear();
     await releaseLock();
+  });
+
+  pi.on("tool_call", async (event, ctx) => reflectionGuard(event, ctx));
+
+  pi.on("session_compact", async (_event, ctx) => {
+    if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
+    const name = currentAgentFromCwd(ctx.cwd);
+    if (!name) return;
+    const manifest = await readManifest(name).catch(() => undefined);
+    if (!manifest || !memoryReflectionEnabled(manifest)) return;
+    const every = memoryReflectionAfterCompactions(manifest);
+    const state = await readReflectionState(name);
+    const since = Number(state.compactionsSinceReflection ?? 0) + 1;
+    await updateReflectionState(name, { compactionsSinceReflection: since, lastCompactionAt: nowIso() });
+    if (since < every) return;
+    await updateReflectionState(name, { compactionsSinceReflection: 0, lastReflectionQueuedAt: nowIso() });
+    startReflection(name, ctx.sessionManager.getSessionFile())
+      .then(async (result) => {
+        await updateReflectionState(name, { lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
+        ctx.ui.notify(reflectionStartedSummary(result), "info");
+        startReflectionWatcher(result, ctx);
+      })
+      .catch(async (err) => {
+        await updateReflectionState(name, { lastReflectionError: err instanceof Error ? err.message : String(err), lastReflectionAt: nowIso() });
+        ctx.ui.notify(`Memory reflection failed for ${name}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+      });
   });
 
   pi.on("session_before_switch", async (event, ctx) => {
@@ -815,6 +1143,37 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("agent-memory-status", {
+    description: "Show injected memory files and token budget status for an agent",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: async (args, ctx) => {
+      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Usage: /agent-memory-status [agent] (inside a named agent, agent is optional)");
+      ctx.ui.notify(formatMemoryStatus(await memoryStatus(name)), "info");
+    },
+  });
+
+  async function reflectCommand(args: string, ctx: ExtensionCommandContext) {
+    const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+    if (!name) return usage(ctx, "Usage: /reflect [agent] (inside a named agent, agent is optional)");
+    const result = await startReflection(name, ctx.sessionManager.getSessionFile());
+    await updateReflectionState(name, { compactionsSinceReflection: 0, lastReflectionQueuedAt: nowIso(), lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
+    ctx.ui.notify(reflectionStartedSummary(result), "info");
+    startReflectionWatcher(result, ctx);
+  }
+
+  pi.registerCommand("reflect", {
+    description: "Reflect current agent memory in an orphan session",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: reflectCommand,
+  });
+
+  pi.registerCommand("agent-memory-reflect", {
+    description: "Explicit alias for /reflect",
+    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    handler: reflectCommand,
+  });
+
   pi.registerCommand("agent-clone", {
     description: "Clone the current agent/session into a new persistent agent",
     handler: async (args, ctx) => {
@@ -825,6 +1184,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       if (source) {
         const currentFile = ctx.sessionManager.getSessionFile();
         await cp(agentDir(source), agentDir(newName), { recursive: true, force: false });
+        await mkdir(join(agentDir(newName), "notebook"), { recursive: true });
         await rm(lockPath(newName), { force: true });
         await rm(sessionDir(newName), { recursive: true, force: true });
         await mkdir(sessionDir(newName), { recursive: true });

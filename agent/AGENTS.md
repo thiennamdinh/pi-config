@@ -20,9 +20,12 @@ User context:
 - Occupation/context: computer science / cybersecurity R&D.
 
 Agent structure:
-- Persistent named agents live under `~/.pi/agents/<name>/` with local `AGENTS.md`, memory, skills, messages, manifest, and one durable session.
+- Persistent named agents live under `~/.pi/agents/<name>/` with local `AGENTS.md`, memory, notebook, skills, messages, manifest, and one durable session.
 - Normal root Pi sessions are ephemeral agent `pi`; clone/create a named agent for durable work.
 - Agents may and should update their own `AGENTS.md` when they learn durable operating instructions or role details.
+- Use `memory/` for concise, reflected knowledge that should be injected into the agent context; keep it budgeted and fresh.
+- Use `notebook/` for durable agent-owned notes, research, maps, scratch writeups, and details that can be searched/read later but should not be injected by default.
+- Use `artifacts/` for task outputs, generated reports, consultation logs, and other run-specific files.
 - Agent-specific skills should usually be created under that agent's home, e.g. `~/.pi/agents/<name>/.pi/skills/`; use root/global skills only for broadly shared capabilities.
 
 Local environment notes:
