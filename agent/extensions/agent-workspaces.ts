@@ -620,7 +620,7 @@ async function trimmedFileText(path: string, maxChars = 3000) {
   }
 }
 
-function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflection>>, ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error" | "success"): void } }) {
+function startReflectionWatcher(pi: ExtensionAPI, result: Awaited<ReturnType<typeof startReflection>>, ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error" | "success"): void } }) {
   if (!result.pid) return;
   const key = `${result.target}:${result.reflectionId}`;
   const existing = reflectionWatchTimers.get(key);
@@ -654,6 +654,24 @@ function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflectio
         sidecarSummary ? `\nSidecar summary:\n${sidecarSummary}` : undefined,
       ].filter(Boolean).join("\n");
       ctx.ui.notify(lines, timedOut || stderrBytes ? "warning" : "info");
+      pi.sendMessage(
+        {
+          customType: "reflection-summary",
+          content: lines,
+          display: true,
+          details: {
+            target: result.target,
+            reflectionId: result.reflectionId,
+            sessionDir: result.reflectionSessionDir,
+            beforeTokens: result.before.tokens,
+            afterTokens: after.tokens,
+            state: after.state,
+            stderrBytes,
+            timedOut,
+          },
+        },
+        { deliverAs: "nextTurn" },
+      );
     })().catch((err) => {
       ctx.ui.notify(`Reflection completion check failed for ${result.target}: ${err instanceof Error ? err.message : String(err)}`, "warning");
     });
@@ -1097,7 +1115,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       .then(async (result) => {
         await updateReflectionState(name, { lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
         ctx.ui.notify(reflectionStartedSummary(result), "info");
-        startReflectionWatcher(result, ctx);
+        startReflectionWatcher(pi, result, ctx);
       })
       .catch(async (err) => {
         await updateReflectionState(name, { lastReflectionError: err instanceof Error ? err.message : String(err), lastReflectionAt: nowIso() });
@@ -1185,7 +1203,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     const result = await startReflection(name, ctx.sessionManager.getSessionFile());
     await updateReflectionState(name, { compactionsSinceReflection: 0, lastReflectionQueuedAt: nowIso(), lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
     ctx.ui.notify(reflectionStartedSummary(result), "info");
-    startReflectionWatcher(result, ctx);
+    startReflectionWatcher(pi, result, ctx);
   }
 
   pi.registerCommand("reflect", {
