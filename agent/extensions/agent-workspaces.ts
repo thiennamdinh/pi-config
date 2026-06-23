@@ -1144,18 +1144,19 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-memory-status", {
-    description: "Show injected memory files and token budget status for an agent",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
+    description: "Show injected memory files and token budget status for the current agent",
     handler: async (args, ctx) => {
-      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
-      if (!name) return usage(ctx, "Usage: /agent-memory-status [agent] (inside a named agent, agent is optional)");
+      if (args.trim()) return usage(ctx, "Usage: /agent-memory-status (current named agent only)");
+      const name = currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Usage: /agent-memory-status (inside a named agent)");
       ctx.ui.notify(formatMemoryStatus(await memoryStatus(name)), "info");
     },
   });
 
   async function reflectCommand(args: string, ctx: ExtensionCommandContext) {
-    const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
-    if (!name) return usage(ctx, "Usage: /reflect [agent] (inside a named agent, agent is optional)");
+    if (args.trim()) return usage(ctx, "Usage: /reflect (current named agent only)");
+    const name = currentAgentFromCwd(ctx.cwd);
+    if (!name) return usage(ctx, "Usage: /reflect (inside a named agent)");
     const result = await startReflection(name, ctx.sessionManager.getSessionFile());
     await updateReflectionState(name, { compactionsSinceReflection: 0, lastReflectionQueuedAt: nowIso(), lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
     ctx.ui.notify(reflectionStartedSummary(result), "info");
@@ -1164,13 +1165,11 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.registerCommand("reflect", {
     description: "Reflect current agent memory in an orphan session",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: reflectCommand,
   });
 
   pi.registerCommand("agent-memory-reflect", {
     description: "Explicit alias for /reflect",
-    getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: reflectCommand,
   });
 

@@ -92,8 +92,8 @@ Initial behavior:
 Possible commands:
 
 ```text
-/agent-memory-status [agent]
-/agent-memory-audit [agent]
+/agent-memory-status
+/agent-memory-audit
 ```
 
 ## Reflection
@@ -154,10 +154,11 @@ next main-agent turn receives updated memory
 Keep manual reflection as an override, analogous to manual compaction:
 
 ```text
-/reflect                    # reflect current agent memory
-/reflect <agent>            # optionally reflect another named agent if implemented safely
-/agent-memory-reflect [agent] # explicit/verbose alias
+/reflect                 # reflect current named agent memory
+/agent-memory-reflect    # explicit/verbose alias
 ```
+
+`/reflect` is intentionally current-agent-only. Cross-agent reflection is a footgun because reflection must fork the target agent's current conversation. To reflect another agent, switch/open that agent first.
 
 `/reflect` should run after the current conversation turn is idle, fork/orphan a reflection session, snapshot memory, and atomically publish memory edits. It should not mutate memory mid-turn.
 
@@ -208,7 +209,7 @@ Rationale: avoids tiny Git repos and public repo concerns while preserving rollb
 3. Add `/agent-memory-status` to show injected files and estimated tokens.
 4. Add reflection-mode tool guard: reads only under target agent workspace; writes only under target `memory/`.
 5. Add snapshot helper around memory edits.
-6. Add manual `/reflect` command, with `/agent-memory-reflect [agent]` as explicit alias, that edits only local `memory/`.
+6. Add manual current-agent-only `/reflect` command, with `/agent-memory-reflect` as explicit alias, that edits only local `memory/`.
 7. Add usage/compaction-triggered reflection after idle, with atomic memory publish.
 7. Consider optional scheduled fallback later.
 8. Consider session/FTS indexing later if retrospective search becomes painful.
