@@ -395,11 +395,23 @@ async function memoryStatus(name: string) {
   return { name, files, tokens, budget, band, state };
 }
 
-function formatMemoryStatus(status: Awaited<ReturnType<typeof memoryStatus>>) {
+function formatMemoryStatus(status: Awaited<ReturnType<typeof memoryStatus>>, reflectionState: Record<string, any> = {}) {
   const fileLines = status.files.length
     ? status.files.map((file) => `- ${file.relativePath}: ~${file.tokens} tokens`).join("\n")
     : "- no injected memory files";
-  return `Agent memory status: ${status.name}\n\nInjected memory: ~${status.tokens} tokens\nTarget: ${status.budget} tokens\nBand: ${status.band.lower}–${status.band.upper} tokens\nState: ${status.state}\n\nFiles:\n${fileLines}`;
+  const reflectionLines = reflectionState.lastReflectionCompletedAt
+    ? [
+        "",
+        "Last reflection:",
+        `- completed: ${reflectionState.lastReflectionCompletedAt}`,
+        reflectionState.lastReflectionBeforeTokens !== undefined && reflectionState.lastReflectionAfterTokens !== undefined
+          ? `- memory: ~${reflectionState.lastReflectionBeforeTokens} → ~${reflectionState.lastReflectionAfterTokens} tokens`
+          : undefined,
+        reflectionState.lastReflectionSessionDir ? `- logs: ${reflectionState.lastReflectionSessionDir}` : undefined,
+        reflectionState.lastReflectionSummary ? `\nSidecar summary:\n${preview(String(reflectionState.lastReflectionSummary), 3000)}` : undefined,
+      ].filter(Boolean).join("\n")
+    : "";
+  return `Agent memory status: ${status.name}\n\nInjected memory: ~${status.tokens} tokens\nTarget: ${status.budget} tokens\nBand: ${status.band.lower}–${status.band.upper} tokens\nState: ${status.state}\n\nFiles:\n${fileLines}${reflectionLines}`;
 }
 
 async function snapshotMemory(name: string) {
@@ -598,6 +610,16 @@ async function fileSize(path: string) {
   }
 }
 
+async function trimmedFileText(path: string, maxChars = 3000) {
+  try {
+    const text = (await readFile(path, "utf8")).trim();
+    if (text.length <= maxChars) return text;
+    return `…${text.slice(-maxChars)}`;
+  } catch {
+    return "";
+  }
+}
+
 function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflection>>, ctx: { ui: { notify(message: string, level?: "info" | "warning" | "error" | "success"): void } }) {
   if (!result.pid) return;
   const key = `${result.target}:${result.reflectionId}`;
@@ -612,6 +634,7 @@ function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflectio
     (async () => {
       const after = await memoryStatus(result.target);
       const stderrBytes = await fileSize(result.stderrPath);
+      const sidecarSummary = await trimmedFileText(result.stdoutPath, 3000);
       await updateReflectionState(result.target, {
         lastReflectionCompletedAt: nowIso(),
         lastReflectionSessionDir: result.reflectionSessionDir,
@@ -619,6 +642,7 @@ function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflectio
         lastReflectionBeforeTokens: result.before.tokens,
         lastReflectionAfterTokens: after.tokens,
         lastReflectionStderrBytes: stderrBytes,
+        lastReflectionSummary: sidecarSummary || undefined,
       });
       const timedOut = checks >= 720 && pidIsAlive(result.pid);
       const lines = [
@@ -627,6 +651,7 @@ function startReflectionWatcher(result: Awaited<ReturnType<typeof startReflectio
         `Target band: ${after.band.lower}–${after.band.upper} tokens`,
         `Session/logs: ${result.reflectionSessionDir}`,
         stderrBytes ? `stderr has ${stderrBytes} bytes; inspect logs if behavior looks wrong.` : undefined,
+        sidecarSummary ? `\nSidecar summary:\n${sidecarSummary}` : undefined,
       ].filter(Boolean).join("\n");
       ctx.ui.notify(lines, timedOut || stderrBytes ? "warning" : "info");
     })().catch((err) => {
@@ -1149,7 +1174,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       if (args.trim()) return usage(ctx, "Usage: /agent-memory-status (current named agent only)");
       const name = currentAgentFromCwd(ctx.cwd);
       if (!name) return usage(ctx, "Usage: /agent-memory-status (inside a named agent)");
-      ctx.ui.notify(formatMemoryStatus(await memoryStatus(name)), "info");
+      ctx.ui.notify(formatMemoryStatus(await memoryStatus(name), await readReflectionState(name)), "info");
     },
   });
 
