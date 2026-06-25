@@ -176,11 +176,104 @@ function resultByteSize(result: unknown) {
   }
 }
 
+function shellWords(fragment: string): string[] {
+  const words: string[] = [];
+  const re = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+/g;
+  for (const match of fragment.matchAll(re)) {
+    words.push(match[0].replace(/^['"]|['"]$/g, ""));
+  }
+  return words;
+}
+
+function splitShellFragments(command: string): string[] {
+  return command
+    .split(/\n|&&|\|\||;|\|/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function normalizeCommandName(command: string): string {
+  return basename(command).replace(/^(?:g)?timeout$/, "timeout");
+}
+
+function skipEnvironmentAssignments(words: string[], start: number) {
+  let i = start;
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(words[i])) {
+    const assignment = words[i];
+    i++;
+    // Best-effort handling for unquoted command substitutions inside env vars,
+    // e.g. NODE_PATH=$(npm root -g) node script.js.
+    if (assignment.includes("$(") && !assignment.includes(")")) {
+      while (i < words.length && !words[i].includes(")")) i++;
+      if (i < words.length) i++;
+    }
+  }
+  return i;
+}
+
+function classifyShellWords(words: string[]): string | undefined {
+  let i = 0;
+
+  // Skip leading environment assignments and common command wrappers.
+  i = skipEnvironmentAssignments(words, i);
+  while (["sudo", "command", "builtin", "exec", "env", "time", "nice", "nohup"].includes(words[i])) {
+    i++;
+    while (i < words.length && words[i]?.startsWith("-")) i++;
+    i = skipEnvironmentAssignments(words, i);
+  }
+
+  const first = normalizeCommandName(words[i] ?? "");
+  if (!first) return undefined;
+
+  if (first === "cd") return undefined;
+  if (first === "set" || first === "export" || first === "unset") return undefined;
+  if (["for", "while", "until", "if", "case"].includes(first)) return "bash:shell-control";
+  if (first === "timeout") {
+    let j = i + 1;
+    while (j < words.length && /^-/.test(words[j])) j++;
+    if (j < words.length && /^\d+(?:\.\d+)?[smhd]?$/.test(words[j])) j++;
+    const inner = classifyShellWords(words.slice(j));
+    return inner ? `${inner}:timeout` : "bash:timeout";
+  }
+
+  const aliases: Record<string, string> = {
+    py: "python",
+    python3: "python",
+    pip3: "pip",
+    npx: "npm",
+    rg: "rg",
+    ripgrep: "rg",
+    fd: "fd",
+    fdfind: "fd",
+  };
+  const normalized = aliases[first] ?? first;
+
+  const known = new Set([
+    "apt", "awk", "bash", "bat", "brew", "cat", "cargo", "cmake", "cp", "curl", "deno", "diff", "dnf", "docker",
+    "emacsclient", "fd", "find", "gh", "git", "go", "grep", "head", "hyperfine", "jq", "less", "ls", "make",
+    "mkdir", "mv", "node", "npm", "od", "perl", "pip", "pnpm", "podman", "python", "pytest", "rg", "rm", "rsync",
+    "ruff", "sed", "sleep", "sort", "tail", "tar", "tee", "tmux", "touch", "tree", "tsc", "uv", "vitest", "wc",
+    "xargs", "yarn", "yq",
+  ]);
+  if (known.has(normalized)) return `bash:${normalized}`;
+
+  if (/^(cargo|npm|pnpm|yarn|go|python|node|pytest|ruff|mypy|tsc|vitest|jest|gh|git)-?/.test(normalized)) {
+    return `bash:${normalized}`;
+  }
+
+  return undefined;
+}
+
 function commandSignature(command: string) {
   const trimmed = command.trim();
   if (!trimmed) return "bash:empty";
-  const first = trimmed.split(/\s+/)[0];
-  if (["rg", "grep", "fd", "find", "ls", "git", "npm", "pnpm", "yarn", "cargo", "go", "python", "python3", "node", "jq", "yq"].includes(first)) return `bash:${first}`;
+
+  const classifications = splitShellFragments(trimmed)
+    .map((fragment) => classifyShellWords(shellWords(fragment)))
+    .filter(Boolean) as string[];
+  const setupOrFilter = new Set(["bash:cat", "bash:cp", "bash:head", "bash:ls", "bash:mkdir", "bash:mv", "bash:rm", "bash:sleep", "bash:tail", "bash:tee", "bash:touch", "bash:wc"]);
+  const primary = classifications.find((sig) => !setupOrFilter.has(sig)) ?? classifications[0];
+  if (primary) return primary;
   return "bash:other";
 }
 
