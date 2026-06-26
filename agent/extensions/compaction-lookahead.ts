@@ -3,11 +3,9 @@ import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   buildSessionContext,
-  compact,
   DEFAULT_COMPACTION_SETTINGS,
   estimateTokens,
   generateSummary,
-  prepareCompaction,
   type AgentMessage,
   type CompactionEntry,
   type CompactionSettings,
@@ -219,6 +217,39 @@ function contextMessagesFromBranch(branch: SessionEntry[], leafId?: string | nul
   return buildSessionContext(branch, leafId).messages;
 }
 
+type BootstrapPreparation = {
+  firstKeptEntryId: string;
+  messagesToSummarize: AgentMessage[];
+  tokensBefore: number;
+};
+
+function prepareBootstrapLookahead(branch: SessionEntry[], settings: CompactionSettings): BootstrapPreparation | undefined {
+  if (branch.length === 0) return undefined;
+
+  const tokensBefore = estimateMessagesTokens(contextMessagesFromBranch(branch));
+  let retainedTokens = 0;
+  let firstKeptIndex = -1;
+
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const messages = contextMessagesFromBranch([branch[i]]);
+    const tokens = estimateMessagesTokens(messages);
+    if (tokens === 0) continue;
+    retainedTokens += tokens;
+    firstKeptIndex = i;
+    if (retainedTokens >= settings.keepRecentTokens) break;
+  }
+
+  if (firstKeptIndex <= 0) return undefined;
+  while (firstKeptIndex < branch.length && !branch[firstKeptIndex]?.id) firstKeptIndex++;
+  const firstKeptEntry = branch[firstKeptIndex];
+  if (!firstKeptEntry?.id) return undefined;
+
+  const messagesToSummarize = contextMessagesFromBranch(branch.slice(0, firstKeptIndex));
+  if (messagesToSummarize.length === 0) return undefined;
+
+  return { firstKeptEntryId: firstKeptEntry.id, messagesToSummarize, tokensBefore };
+}
+
 function shouldRunAutomaticLookahead(ctx: ExtensionContext): boolean {
   return ctx.hasUI && !process.env.PI_OFFLINE;
 }
@@ -315,19 +346,20 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
     const sessionId = ctx.sessionManager.getSessionId();
     const settings = readCompactionSettings();
     const branch = ctx.sessionManager.getBranch();
-    const preparation = prepareCompaction(branch, settings);
+    const preparation = prepareBootstrapLookahead(branch, settings);
     if (!preparation) return;
-    if (preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0) return;
     const approxSummarizeTokens = estimateMessagesTokens(preparation.messagesToSummarize);
     if (approxSummarizeTokens < MIN_BOOTSTRAP_TOKENS_TO_SUMMARIZE) return;
 
     const thinkingLevel = pi.getThinkingLevel();
     const { model, apiKey, headers } = await getModelAuth(ctx);
-    const result = await compact(
-      preparation,
+    const summary = await generateSummary(
+      preparation.messagesToSummarize,
       model,
+      settings.reserveTokens,
       apiKey,
       headers,
+      undefined,
       DURABLE_SUMMARY_INSTRUCTIONS,
       undefined,
       thinkingLevel,
@@ -339,23 +371,23 @@ async function computeBootstrapLookahead(pi: ExtensionAPI, ctx: ExtensionContext
       sessionFile,
       sessionId,
       createdAt: new Date().toISOString(),
-      summary: result.summary,
-      firstKeptEntryId: result.firstKeptEntryId,
-      tokensBeforeEstimate: result.tokensBefore,
+      summary,
+      firstKeptEntryId: preparation.firstKeptEntryId,
+      tokensBeforeEstimate: preparation.tokensBefore,
       settings,
       model: `${model.provider}/${model.id}`,
     });
-    const outputTokens = Math.ceil(result.summary.length / 4);
-    const estimatedCost = estimateCost(model, result.tokensBefore, outputTokens);
+    const outputTokens = Math.ceil(summary.length / 4);
+    const estimatedCost = estimateCost(model, preparation.tokensBefore, outputTokens);
     appendLookaheadUsage(ctx, {
       action: "compaction-lookahead-bootstrap",
-      firstKeptEntryId: result.firstKeptEntryId,
-      tokensBeforeEstimate: result.tokensBefore,
-      summaryChars: result.summary.length,
+      firstKeptEntryId: preparation.firstKeptEntryId,
+      tokensBeforeEstimate: preparation.tokensBefore,
+      summaryChars: summary.length,
       summaryTokenEstimate: outputTokens,
-      inputTokens: result.tokensBefore,
+      inputTokens: preparation.tokensBefore,
       outputTokens,
-      totalTokens: result.tokensBefore + outputTokens,
+      totalTokens: preparation.tokensBefore + outputTokens,
       costInput: estimatedCost.input,
       costOutput: estimatedCost.output,
       costTotal: estimatedCost.total,
