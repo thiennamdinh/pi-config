@@ -14,3 +14,5 @@ agent/tmp/
 agents/
 # Local helper binaries/caches
 agent/bin/
+agent/node_modules/
+cache/

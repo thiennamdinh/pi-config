@@ -36,6 +36,11 @@ type Manifest = {
     enabled?: boolean;
     afterCompactions?: number;
   };
+  inboxAutopilot?: {
+    enabled?: boolean;
+    types?: string[];
+    debounceMs?: number;
+  };
 };
 
 type MessageType = "tell" | "ask" | "ask_request" | "task" | "execute" | "answer" | "ask_answer" | "event";
@@ -57,10 +62,13 @@ type AgentMessage = {
 
 let activeAgent: string | null = null;
 let activeLockPath: string | null = null;
+let suppressedLockedAgent: string | null = null;
 let recoveryTimer: NodeJS.Timeout | undefined;
 let inboxNoticeTimer: NodeJS.Timeout | undefined;
 const reflectionWatchTimers = new Map<string, NodeJS.Timeout>();
 const notifiedInboxMessageIds = new Map<string, Set<string>>();
+const inboxAutopilotTimers = new Map<string, NodeJS.Timeout>();
+const inboxAutopilotInFlight = new Set<string>();
 
 function validateAgentName(name: string, options: { allowPi?: boolean } = {}) {
   const trimmed = name.trim();
@@ -148,6 +156,7 @@ function currentAgentFromCwd(cwd: string) {
   const rel = current.slice(root.length + 1);
   const name = rel.split("/")[0];
   if (!name || name.startsWith(".")) return null;
+  if (suppressedLockedAgent === name) return null;
   return existsSync(manifestPath(name)) ? name : null;
 }
 
@@ -284,7 +293,7 @@ async function switchToAgent(pi: ExtensionAPI, name: string, ctx: ExtensionComma
     withSession: async (next: ReplacedSessionContext) => {
       next.ui.notify(note ?? `Switched to agent ${name}`, "info");
       await applyManifest(pi, name, next);
-      startInboxNoticeLoop(name, next as any);
+      startInboxNoticeLoop(pi, name, next as any);
       if (runPrompt) {
         await next.sendUserMessage(runPrompt);
         await next.waitForIdle();
@@ -969,27 +978,109 @@ function shouldNotifyInboxMessage(agent: string, msg: AgentMessage) {
   return msg.status === "queued" || msg.status === "processing" || msg.status === "done";
 }
 
-async function notifyNewInboxMessages(name: string, ctx: ExtensionCommandContext) {
+async function inboxAutopilotConfig(name: string) {
+  const manifest = await readManifest(name).catch(() => undefined);
+  const raw = manifest?.inboxAutopilot;
+  if (!raw?.enabled) return undefined;
+  const types = new Set((raw.types?.length ? raw.types : ["task"]).filter((type) => type === "task"));
+  if (types.size === 0) return undefined;
+  const debounceMs = Math.max(1_000, Math.min(60_000, Number(raw.debounceMs ?? 5_000)));
+  return { types, debounceMs };
+}
+
+function formatAutopilotPrompt(tasks: AgentMessage[]) {
+  return [
+    "You have new task messages in your agent inbox. Treat this as an instruction to act now, not just to acknowledge the inbox.",
+    "",
+    "Process the task messages below in order. If a task asks you to continue work, start doing that work immediately using the available tools. Do not merely summarize current status unless the task is impossible, unsafe, stale, or blocked; if blocked, say exactly what blocks you. Do not create ping-pong messages unless explicitly useful.",
+    "",
+    ...tasks.map((msg) => `- ${msg.id} from ${msg.from} at ${msg.createdAt}:\n${msg.body}`),
+  ].join("\n");
+}
+
+async function markMessagesProcessing(name: string, ids: string[]) {
+  const messages = await readAgentMessages(name);
+  const idSet = new Set(ids);
+  let changed = false;
+  const updated = messages.map((msg) => {
+    if (!idSet.has(msg.id) || msg.status !== "queued") return msg;
+    changed = true;
+    return { ...msg, status: "processing" as const, updatedAt: nowIso() };
+  });
+  if (changed) await writeAgentMessages(name, updated);
+}
+
+async function waitForIdleBounded(ctx: { waitForIdle?: () => Promise<void> }, timeoutMs = 30_000) {
+  if (typeof ctx.waitForIdle !== "function") return;
+  await Promise.race([
+    ctx.waitForIdle(),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
+async function processInboxAutopilot(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
+  if (inboxAutopilotInFlight.has(name)) return;
+  const config = await inboxAutopilotConfig(name);
+  if (!config) return;
+  const tasks = (await readAgentMessages(name))
+    .filter((msg) => msg.status === "queued" && config.types.has(msg.type))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  if (tasks.length === 0) return;
+  inboxAutopilotInFlight.add(name);
+  try {
+    await waitForIdleBounded(ctx);
+    const stillQueued = (await readAgentMessages(name))
+      .filter((msg) => tasks.some((task) => task.id === msg.id) && msg.status === "queued")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    if (stillQueued.length === 0) return;
+    await markMessagesProcessing(name, stillQueued.map((msg) => msg.id));
+    pi.sendUserMessage(formatAutopilotPrompt(stillQueued), { deliverAs: "followUp" });
+    ctx.ui.notify(`Inbox autopilot queued ${stillQueued.length} task${stillQueued.length === 1 ? "" : "s"}.`, "info");
+  } finally {
+    inboxAutopilotInFlight.delete(name);
+  }
+}
+
+function scheduleInboxAutopilot(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
+  inboxAutopilotConfig(name).then((config) => {
+    if (!config) return;
+    const existing = inboxAutopilotTimers.get(name);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      inboxAutopilotTimers.delete(name);
+      processInboxAutopilot(pi, name, ctx).catch((error) => {
+        ctx.ui.notify(`Inbox autopilot failed for ${name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      });
+    }, config.debounceMs);
+    timer.unref?.();
+    inboxAutopilotTimers.set(name, timer);
+  }).catch(() => undefined);
+}
+
+async function notifyNewInboxMessages(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
   const seen = notifiedInboxMessageIds.get(name) ?? new Set<string>();
   notifiedInboxMessageIds.set(name, seen);
   const messages = await readAgentMessages(name);
   const senders = new Set<string>();
+  let sawNewTask = false;
   for (const msg of messages) {
     if (seen.has(msg.id)) continue;
     seen.add(msg.id);
     if (shouldNotifyInboxMessage(name, msg)) senders.add(msg.from);
+    if (msg.status === "queued" && msg.type === "task") sawNewTask = true;
   }
   for (const sender of [...senders].sort()) {
     ctx.ui.notify(`New agent message from ${sender}.`, "info");
   }
+  if (sawNewTask) scheduleInboxAutopilot(pi, name, ctx);
 }
 
-function startInboxNoticeLoop(name: string, ctx: ExtensionCommandContext) {
+function startInboxNoticeLoop(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
   if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
   inboxNoticeTimer = undefined;
   if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
   const tick = () => {
-    notifyNewInboxMessages(name, ctx).catch(() => undefined);
+    notifyNewInboxMessages(pi, name, ctx).catch(() => undefined);
   };
   tick();
   inboxNoticeTimer = setInterval(tick, 5000);
@@ -1067,9 +1158,16 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
             ctx.ui.notify(`Agent ${name} memory is ${status.state} target band: ~${status.tokens} tokens, band ${status.band.lower}–${status.band.upper}. Use /agent-memory-status for details.`, status.state === "above" ? "warning" : "info");
           }
         }
-        startInboxNoticeLoop(name, ctx as ExtensionCommandContext);
+        startInboxNoticeLoop(pi, name, ctx as ExtensionCommandContext);
       } catch (err) {
-        ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes(`Agent ${name} is already active`)) {
+          suppressedLockedAgent = name;
+          ctx.ui.notify(`${message}; opened generic pi instead.`, "warning");
+          ctx.ui.setStatus?.("agent-workspace", "agent:pi");
+          return;
+        }
+        ctx.ui.notify(message, "error");
         ctx.shutdown();
       }
     } else {
@@ -1094,6 +1192,9 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     inboxNoticeTimer = undefined;
     for (const timer of reflectionWatchTimers.values()) clearInterval(timer);
     reflectionWatchTimers.clear();
+    for (const timer of inboxAutopilotTimers.values()) clearTimeout(timer);
+    inboxAutopilotTimers.clear();
+    inboxAutopilotInFlight.clear();
     await releaseLock();
   });
 
@@ -1282,6 +1383,21 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const name = currentAgentFromCwd(ctx.cwd);
       if (!name) throw new Error("Ephemeral pi cannot be deleted.");
+      const expected = name;
+      const entered = await ctx.ui.input(
+        "Delete agent?",
+        `This will move agent ${name} to ~/.pi/agents/.trash/. Type the agent name to confirm.`,
+        ""
+      );
+      if (entered !== expected) {
+        ctx.ui.notify(`Agent delete cancelled for ${name}.`, "info");
+        return;
+      }
+      const ok = await ctx.ui.confirm("Confirm agent delete", `Move agent ${name} to ~/.pi/agents/.trash/?`);
+      if (!ok) {
+        ctx.ui.notify(`Agent delete cancelled for ${name}.`, "info");
+        return;
+      }
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const dest = join(TRASH_ROOT, `${name}-${stamp}`);
       await mkdir(TRASH_ROOT, { recursive: true });
@@ -1345,6 +1461,30 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       if (!name) return usage(ctx, "Usage: /agent-ask-recover <agent>");
       const recovered = await recoverAgentAsks(name);
       ctx.ui.notify(recovered.length ? `Recovered ${recovered.length} ask(s) for ${name}.` : `No recoverable asks for ${name}.`, recovered.length ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("agent-inbox-autopilot", {
+    description: "Show or toggle task-message inbox autopilot for the current agent",
+    handler: async (args, ctx) => {
+      const name = currentAgentFromCwd(ctx.cwd);
+      if (!name) return usage(ctx, "Inbox autopilot is available only in a named agent.");
+      const action = args.trim().toLowerCase();
+      const manifest = await readManifest(name);
+      if (!action || action === "status") {
+        const cfg = manifest.inboxAutopilot;
+        ctx.ui.notify(`Inbox autopilot for ${name}: ${cfg?.enabled ? "enabled" : "disabled"}; types=${cfg?.types?.join(",") ?? "task"}; debounceMs=${cfg?.debounceMs ?? 5000}`, "info");
+        return;
+      }
+      if (action !== "on" && action !== "off") return usage(ctx, "Usage: /agent-inbox-autopilot [status|on|off]");
+      manifest.inboxAutopilot = {
+        ...(manifest.inboxAutopilot ?? {}),
+        enabled: action === "on",
+        types: manifest.inboxAutopilot?.types ?? ["task"],
+        debounceMs: manifest.inboxAutopilot?.debounceMs ?? 5000,
+      };
+      await writeManifest(manifest);
+      ctx.ui.notify(`Inbox autopilot ${action === "on" ? "enabled" : "disabled"} for ${name}.`, "info");
     },
   });
 
