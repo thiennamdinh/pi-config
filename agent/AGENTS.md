@@ -21,6 +21,8 @@ User context:
 
 Agent structure:
 - Persistent named agents live under `~/.pi/agents/<name>/` with local `AGENTS.md`, memory, notebook, skills, messages, manifest, and one durable session.
+- Agent home and working cwd are distinct: agent-owned state stays under `~/.pi/agents/<name>/`, while `manifest.workingDirectory` may point at the active project so project `AGENTS.md`/tools/relative paths work naturally.
+- If relative paths, project-local `AGENTS.md`, project tools, or repo context matter, agents should use `/agent-cwd <project-dir>` to set their working directory to the active project.
 - Normal root Pi sessions are ephemeral agent `pi`; clone/create a named agent for durable work.
 - Agents may and should update their own `AGENTS.md` when they learn durable operating instructions or role details.
 - Use `memory/` for concise, reflected knowledge that should be injected into the agent context; keep it budgeted and fresh.

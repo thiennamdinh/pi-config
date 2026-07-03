@@ -28,7 +28,8 @@ type Manifest = {
   thinkingLevel?: string;
   tools?: string[];
   permissions?: Record<string, unknown>;
-  cwdPolicy: "agent-home";
+  cwdPolicy: "agent-home" | "working-directory";
+  workingDirectory?: string;
   sessionFile?: string;
   maxRuntimeSeconds?: number;
   memoryBudgetTokens?: number;
@@ -160,6 +161,42 @@ function currentAgentFromCwd(cwd: string) {
   return existsSync(manifestPath(name)) ? name : null;
 }
 
+function workingDirectoryForManifest(manifest: Manifest) {
+  const raw = manifest.cwdPolicy === "working-directory" ? manifest.workingDirectory : undefined;
+  if (!raw) return agentDir(manifest.name);
+  return resolve(raw.replace(/^~(?=\/|$)/, HOME));
+}
+
+async function workingDirectoryForAgent(name: string) {
+  return workingDirectoryForManifest(await readManifest(name));
+}
+
+async function chdirToAgentWorkingDirectory(name: string, ctx: { ui?: ExtensionCommandContext["ui"] }) {
+  const cwd = await workingDirectoryForAgent(name);
+  try {
+    process.chdir(cwd);
+  } catch (error) {
+    ctx.ui?.notify(`Agent ${name}: could not enter working directory ${cwd}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+  }
+}
+
+async function agentFromSessionFile(sessionFile: string | undefined) {
+  if (!sessionFile) return null;
+  const resolved = resolve(sessionFile);
+  for (const name of await listAgents()) {
+    const manifest = await readManifest(name).catch(() => undefined);
+    if (!manifest?.sessionFile) continue;
+    if (resolve(manifest.sessionFile) === resolved) return name;
+  }
+  return null;
+}
+
+async function currentAgentFromContext(ctx: { cwd?: string; sessionManager?: { getSessionFile(): string | undefined } }) {
+  const fromSession = await agentFromSessionFile(ctx.sessionManager?.getSessionFile());
+  if (fromSession && suppressedLockedAgent !== fromSession) return fromSession;
+  return ctx.cwd ? currentAgentFromCwd(ctx.cwd) : null;
+}
+
 async function readManifest(name: string): Promise<Manifest> {
   return readJson<Manifest>(manifestPath(name));
 }
@@ -193,7 +230,7 @@ async function forceWriteSession(manager: SessionManager) {
 }
 
 async function rewriteSessionWorkspace(sessionFile: string, name: string) {
-  const cwd = agentDir(name);
+  const cwd = await workingDirectoryForAgent(name);
   const lines = (await readFile(sessionFile, "utf8")).split("\n").filter((line) => line.trim());
   const entries = lines.map((line) => JSON.parse(line));
   let sawSessionInfo = false;
@@ -244,9 +281,12 @@ async function createAgentWorkspace(name: string, description = "") {
 
 async function ensureAgentSession(name: string) {
   const manifest = await readManifest(name);
-  if (manifest.sessionFile && (await exists(manifest.sessionFile))) return manifest.sessionFile;
+  if (manifest.sessionFile && (await exists(manifest.sessionFile))) {
+    await rewriteSessionWorkspace(manifest.sessionFile, name);
+    return manifest.sessionFile;
+  }
 
-  const manager = SessionManager.create(agentDir(name), sessionDir(name));
+  const manager = SessionManager.create(await workingDirectoryForAgent(name), sessionDir(name));
   manager.appendSessionInfo(name);
   await forceWriteSession(manager);
   const sessionFile = manager.getSessionFile();
@@ -839,7 +879,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     from,
     body,
     args,
-    cwd: agentDir(target),
+    cwd: await workingDirectoryForAgent(target),
     sessionDir: tmpSessionDir,
     artifactPath,
     stdoutPath,
@@ -854,7 +894,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     stdoutFd = openSync(stdoutPath, "a");
     stderrFd = openSync(stderrPath, "a");
     const child = spawn("pi", args, {
-      cwd: agentDir(target),
+      cwd: await workingDirectoryForAgent(target),
       env: { ...process.env, PI_AGENT_EPHEMERAL_CLONE: "1" },
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
@@ -878,7 +918,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 }
 
 async function currentAgent(ctx: ExtensionCommandContext) {
-  return currentAgentFromCwd(ctx.cwd) ?? "pi";
+  return (await currentAgentFromContext(ctx)) ?? activeAgent ?? "pi";
 }
 
 async function acquireLock(name: string, ctx: { cwd: string; sessionManager: { getSessionFile(): string | undefined } }) {
@@ -1010,12 +1050,17 @@ async function markMessagesProcessing(name: string, ids: string[]) {
   if (changed) await writeAgentMessages(name, updated);
 }
 
-async function waitForIdleBounded(ctx: { waitForIdle?: () => Promise<void> }, timeoutMs = 30_000) {
-  if (typeof ctx.waitForIdle !== "function") return;
-  await Promise.race([
-    ctx.waitForIdle(),
-    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
-  ]);
+async function waitForIdleBounded(ctx: { waitForIdle?: () => Promise<void>; isIdle?: () => boolean }, timeoutMs = 30_000) {
+  if (typeof ctx.waitForIdle === "function") {
+    await Promise.race([
+      ctx.waitForIdle(),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+    return;
+  }
+  if (typeof ctx.isIdle !== "function") return;
+  const started = Date.now();
+  while (!ctx.isIdle() && Date.now() - started < timeoutMs) await delay(500);
 }
 
 async function processInboxAutopilot(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
@@ -1147,10 +1192,11 @@ function reflectionGuard(event: any, ctx: { cwd: string }) {
 export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     startRecoveryLoop(ctx as any);
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (name) {
       try {
         if (!IS_EPHEMERAL_CLONE && !IS_REFLECTION) await acquireLock(name, ctx);
+        if (!IS_REFLECTION) await chdirToAgentWorkingDirectory(name, ctx as any);
         await applyManifest(pi, name, ctx as any);
         if (!IS_REFLECTION) {
           const status = await memoryStatus(name).catch(() => undefined);
@@ -1202,7 +1248,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   pi.on("session_compact", async (_event, ctx) => {
     if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (!name) return;
     const manifest = await readManifest(name).catch(() => undefined);
     if (!manifest || !memoryReflectionEnabled(manifest)) return;
@@ -1225,7 +1271,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", async (event, ctx) => {
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (!name) return;
     if (allowNextManagedSwitchToPi) {
       allowNextManagedSwitchToPi = false;
@@ -1242,14 +1288,14 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.on("session_before_fork", async (_event, ctx) => {
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (!name) return;
     ctx.ui.notify(`Agent ${name} is managed. Use /agent-clone <new-name> instead of /fork or /clone.`, "warning");
     return { cancel: true };
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (!name) return;
     const extra = await agentInstructions(name);
     if (!extra.trim()) return;
@@ -1287,11 +1333,33 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("agent-cwd", {
+    description: "Show or set the current agent's working directory",
+    handler: async (args, ctx) => {
+      const name = await currentAgentFromContext(ctx);
+      if (!name) return usage(ctx, "Usage: /agent-cwd [path] (inside a named agent)");
+      const manifest = await readManifest(name);
+      const arg = args.trim();
+      if (!arg) {
+        ctx.ui.notify(`Agent ${name}\nhome: ${agentDir(name)}\nworkingDirectory: ${workingDirectoryForManifest(manifest)}\ncwdPolicy: ${manifest.cwdPolicy}`, "info");
+        return;
+      }
+      const next = resolve(arg.replace(/^~(?=\/|$)/, HOME));
+      if (!(await exists(next))) return ctx.ui.notify(`Directory does not exist: ${next}`, "warning");
+      manifest.cwdPolicy = next === agentDir(name) ? "agent-home" : "working-directory";
+      manifest.workingDirectory = manifest.cwdPolicy === "working-directory" ? next : undefined;
+      await writeManifest(manifest);
+      if (manifest.sessionFile && (await exists(manifest.sessionFile))) await rewriteSessionWorkspace(manifest.sessionFile, name);
+      await chdirToAgentWorkingDirectory(name, ctx as any);
+      ctx.ui.notify(`Agent ${name} working directory set to ${workingDirectoryForManifest(manifest)}. Reload/restart if the visible session cwd does not update immediately.`, "info");
+    },
+  });
+
   pi.registerCommand("agent-memory-status", {
     description: "Show injected memory files and token budget status for the current agent",
     handler: async (args, ctx) => {
       if (args.trim()) return usage(ctx, "Usage: /agent-memory-status (current named agent only)");
-      const name = currentAgentFromCwd(ctx.cwd);
+      const name = await currentAgentFromContext(ctx);
       if (!name) return usage(ctx, "Usage: /agent-memory-status (inside a named agent)");
       ctx.ui.notify(formatMemoryStatus(await memoryStatus(name), await readReflectionState(name)), "info");
     },
@@ -1299,7 +1367,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
 
   async function reflectCommand(args: string, ctx: ExtensionCommandContext) {
     if (args.trim()) return usage(ctx, "Usage: /reflect (current named agent only)");
-    const name = currentAgentFromCwd(ctx.cwd);
+    const name = await currentAgentFromContext(ctx);
     if (!name) return usage(ctx, "Usage: /reflect (inside a named agent)");
     const result = await startReflection(name, ctx.sessionManager.getSessionFile());
     await updateReflectionState(name, { compactionsSinceReflection: 0, lastReflectionQueuedAt: nowIso(), lastReflectionStartedAt: nowIso(), lastReflectionSessionDir: result.reflectionSessionDir, lastReflectionPid: result.pid });
@@ -1321,7 +1389,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     description: "Clone the current agent/session into a new persistent agent",
     handler: async (args, ctx) => {
       const newName = sanitizeName(args.trim());
-      const source = currentAgentFromCwd(ctx.cwd);
+      const source = await currentAgentFromContext(ctx);
       if (await exists(agentDir(newName))) throw new Error(`Agent already exists: ${newName}`);
 
       if (source) {
@@ -1334,7 +1402,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
         const manifest = await readManifest(newName);
         manifest.name = newName;
         if (currentFile) {
-          const forked = SessionManager.forkFrom(currentFile, agentDir(newName), sessionDir(newName));
+          const forked = SessionManager.forkFrom(currentFile, ctx.cwd, sessionDir(newName));
           forked.appendSessionInfo(newName);
           await forceWriteSession(forked);
           manifest.sessionFile = forked.getSessionFile();
@@ -1347,7 +1415,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
         const manifest = await readManifest(newName);
         const currentFile = ctx.sessionManager.getSessionFile();
         if (currentFile) {
-          const forked = SessionManager.forkFrom(currentFile, agentDir(newName), sessionDir(newName));
+          const forked = SessionManager.forkFrom(currentFile, ctx.cwd, sessionDir(newName));
           forked.appendSessionInfo(newName);
           await forceWriteSession(forked);
           manifest.sessionFile = forked.getSessionFile();
@@ -1361,7 +1429,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.registerCommand("agent-rename", {
     description: "Rename the current persistent agent",
     handler: async (args, ctx) => {
-      const source = currentAgentFromCwd(ctx.cwd);
+      const source = await currentAgentFromContext(ctx);
       if (!source) throw new Error("Ephemeral pi cannot be renamed. Use /agent-clone <new-name>.");
       const newName = sanitizeName(args.trim());
       if (await exists(agentDir(newName))) throw new Error(`Agent already exists: ${newName}`);
@@ -1381,7 +1449,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.registerCommand("agent-delete", {
     description: "Move the current persistent agent to ~/.pi/agents/.trash/",
     handler: async (_args, ctx) => {
-      const name = currentAgentFromCwd(ctx.cwd);
+      const name = await currentAgentFromContext(ctx);
       if (!name) throw new Error("Ephemeral pi cannot be deleted.");
       const expected = name;
       const entered = await ctx.ui.input(
@@ -1457,7 +1525,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     description: "Recover completed clone ask answers from retained consultation sessions",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
-      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : await currentAgentFromContext(ctx);
       if (!name) return usage(ctx, "Usage: /agent-ask-recover <agent>");
       const recovered = await recoverAgentAsks(name);
       ctx.ui.notify(recovered.length ? `Recovered ${recovered.length} ask(s) for ${name}.` : `No recoverable asks for ${name}.`, recovered.length ? "info" : "warning");
@@ -1467,7 +1535,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.registerCommand("agent-inbox-autopilot", {
     description: "Show or toggle task-message inbox autopilot for the current agent",
     handler: async (args, ctx) => {
-      const name = currentAgentFromCwd(ctx.cwd);
+      const name = await currentAgentFromContext(ctx);
       if (!name) return usage(ctx, "Inbox autopilot is available only in a named agent.");
       const action = args.trim().toLowerCase();
       const manifest = await readManifest(name);
@@ -1492,7 +1560,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     description: "List queued/unabsorbed messages for the current or named agent",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
-      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : currentAgentFromCwd(ctx.cwd);
+      const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : await currentAgentFromContext(ctx);
       if (!name) return usage(ctx, "Usage: /agent-inbox [agent]");
       const messages = await queuedMessages(name);
       if (!messages.length) return ctx.ui.notify(`No queued/unabsorbed messages for ${name}.`, "info");
@@ -1503,7 +1571,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.registerCommand("agent-absorb", {
     description: "Mark an inbox/consultation message absorbed for the current agent",
     handler: async (args, ctx) => {
-      const name = currentAgentFromCwd(ctx.cwd);
+      const name = await currentAgentFromContext(ctx);
       if (!name) return usage(ctx, "Usage: /agent-absorb <message-id> (inside a named agent)");
       const id = args.trim();
       if (!id) return usage(ctx, "Usage: /agent-absorb <message-id>");
@@ -1582,7 +1650,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
         throw new Error(`Unsupported message type: ${requestedType}. Use agent_ask for immediate consultations.`);
       }
       const type: MessageType = requestedType;
-      const from = currentAgentFromCwd(ctx?.cwd ?? "") ?? activeAgent ?? "pi";
+      const from = await currentAgentFromContext(ctx as any) ?? activeAgent ?? "pi";
       const msg = await appendAgentMessage(to, { type, from, body, status: "queued" });
       return {
         content: [{ type: "text", text: `Sent ${type} message ${msg.id} to ${to}.` }],

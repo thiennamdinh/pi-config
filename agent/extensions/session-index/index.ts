@@ -261,6 +261,15 @@ function currentAgentFromCwd(cwd: string | undefined): string | undefined {
   return name && existsSync(join(AGENTS_ROOT, name, "manifest.json")) ? name : undefined;
 }
 
+function currentAgentFromContext(ctx: { cwd?: string; sessionManager?: { getSessionFile?: () => string | undefined } } | undefined): string | undefined {
+  const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+  if (sessionFile) {
+    const agent = detectAgentFromSessionPath(sessionFile);
+    if (agent !== "pi" && agent !== "unknown") return agent;
+  }
+  return currentAgentFromCwd(ctx?.cwd);
+}
+
 function entryToTexts(entry: JsonRecord): Array<{ role: string; entryType: string; text: string; tools: string[]; provider: string; model: string; inputTokens: number; outputTokens: number; costTotal: number; isError: boolean }> {
   const type = asString(entry.type, "unknown");
   if (type === "session") return [];
@@ -746,7 +755,7 @@ export default function sessionIndexExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const requestedAgent = typeof params.agent === "string" ? params.agent : undefined;
-      const defaultAgent = currentAgentFromCwd(ctx?.cwd);
+      const defaultAgent = currentAgentFromContext(ctx as any);
       const state = await rebuildIndex({
         agent: requestedAgent ?? defaultAgent,
         maxFiles: typeof params.maxFiles === "number" ? params.maxFiles : undefined,
