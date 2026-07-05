@@ -14,6 +14,8 @@ const EPHEMERAL_PI_SESSION_DIR = join(HOME, ".pi", "agent", "tmp", "pi-ephemeral
 const EXT_CUSTOM_TYPE = "agent-workspaces";
 const LOCK_STALE_MS = 24 * 60 * 60 * 1000;
 const IS_EPHEMERAL_CLONE = Boolean(process.env.PI_AGENT_EPHEMERAL_CLONE);
+const CONSULTATION_TARGET = process.env.PI_AGENT_CONSULTATION_TARGET;
+const IS_CONSULTATION = Boolean(CONSULTATION_TARGET);
 const IS_REFLECTION = Boolean(process.env.PI_AGENT_REFLECTION);
 const REFLECTION_TARGET = process.env.PI_AGENT_REFLECTION_TARGET;
 const DEFAULT_MEMORY_BUDGET_TOKENS = 25_000;
@@ -192,6 +194,7 @@ async function agentFromSessionFile(sessionFile: string | undefined) {
 }
 
 async function currentAgentFromContext(ctx: { cwd?: string; sessionManager?: { getSessionFile(): string | undefined } }) {
+  if (CONSULTATION_TARGET) return sanitizeName(CONSULTATION_TARGET);
   const fromSession = await agentFromSessionFile(ctx.sessionManager?.getSessionFile());
   if (fromSession && suppressedLockedAgent !== fromSession) return fromSession;
   return ctx.cwd ? currentAgentFromCwd(ctx.cwd) : null;
@@ -517,16 +520,17 @@ async function latestAssistantText(sessionDirectory: string) {
   return "";
 }
 
-function buildClonePrompt(target: string, from: string, requestId: string, body: string) {
-  return `You are an ephemeral read-only consultation clone of agent ${target}.
+function buildConsultationPrompt(target: string, from: string, requestId: string, body: string) {
+  return `You are ${target}, running in a read-only forked side session of your own persistent Pi conversation.
 
-Your answer will be returned to ${from} and logged for the real ${target}. You are advisory: do not assume your response is automatically absorbed by the live target session. If you make durable observations the real ${target} should remember, include a short section titled "Notes for ${target}".
+Your answer will be returned to ${from} and logged for your main agent workspace. This side session may diverge from the live session, but it is still you: use your visible conversation history, injected agent memory, AGENTS.md instructions, and tools as needed. If the question asks for current technical/project state, verify from available source context or explicitly mark unverified claims.
 
 Rules:
 - Answer as ${target} in first person. Do not refer to ${target} in third person except inside "Notes for ${target}".
 - Answer the caller's question directly and concisely, but include enough detail to be useful.
 - Treat this as read-only consultation. Do not edit files or perform side effects.
 - If more context is needed, say what would be needed.
+- If you make durable observations your main session should remember, include a short section titled "Notes for ${target}".
 - Request id: ${requestId}
 - Caller: ${from}
 - Target agent: ${target}
@@ -736,7 +740,7 @@ async function finalizeRecoveredAsk(target: string, request: AgentMessage, answe
   await mkdir(dirname(artifactPath), { recursive: true });
   await writeFile(
     artifactPath,
-    `# Agent ask: ${request.from} → ${target}\n\n- request id: ${request.id}\n- clone id: ${askId}\n- status: done\n- ${note}: ${nowIso()}\n- session dir: ${sessionPath}\n\n## Question\n\n${request.body}\n\n## Answer\n\n${answer}\n`,
+    `# Agent ask: ${request.from} → ${target}\n\n- request id: ${request.id}\n- consultation id: ${askId}\n- status: done\n- ${note}: ${nowIso()}\n- session dir: ${sessionPath}\n\n## Question\n\n${request.body}\n\n## Answer\n\n${answer}\n`,
   );
   await updateAgentMessage(target, request.id, { status: "done" });
   const answerBody = preview(answer);
@@ -744,7 +748,7 @@ async function finalizeRecoveredAsk(target: string, request: AgentMessage, answe
   if (!targetMessages.some((msg) => msg.type === "ask_answer" && msg.replyTo === request.id)) {
     await appendAgentMessage(target, {
       type: "ask_answer",
-      from: `${target}:clone`,
+      from: `${target}:consultation`,
       body: answerBody,
       replyTo: request.id,
       status: "done",
@@ -760,7 +764,7 @@ async function finalizeRecoveredAsk(target: string, request: AgentMessage, answe
       await appendAgentMessageFrom(request.from, {
         type: "ask_answer",
         to: request.from,
-        from: `${target}:clone`,
+        from: `${target}:consultation`,
         body: answerBody,
         replyTo: request.id,
         status: "done",
@@ -813,7 +817,7 @@ async function waitForAskAnswer(target: string, request: AgentMessage, timeoutMs
 }
 
 function startRecoveryLoop(ctx: { ui: ExtensionCommandContext["ui"] }) {
-  if (recoveryTimer || IS_EPHEMERAL_CLONE) return;
+  if (recoveryTimer || IS_EPHEMERAL_CLONE || IS_CONSULTATION) return;
   recoveryTimer = setInterval(() => {
     recoverAllAgentAsks()
       .then((results) => {
@@ -824,7 +828,7 @@ function startRecoveryLoop(ctx: { ui: ExtensionCommandContext["ui"] }) {
   }, 5_000);
 }
 
-async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, targetRaw: string, body: string) {
+async function runAgentAskConsultation(pi: ExtensionAPI, ctx: ExtensionCommandContext, targetRaw: string, body: string) {
   const target = sanitizeName(targetRaw);
   if (!(await exists(manifestPath(target)))) throw new Error(`Unknown agent: ${target}`);
   const from = await currentAgent(ctx);
@@ -854,16 +858,18 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     });
   }
 
+  const sessionFile = await ensureAgentSession(target);
   const model = manifest.model ? ["--model", manifest.model] : [];
   const thinking = manifest.thinkingLevel ? ["--thinking", manifest.thinkingLevel] : [];
-  const prompt = buildClonePrompt(target, from, request.id, body);
+  const prompt = buildConsultationPrompt(target, from, request.id, body);
   const args = [
     "-p",
     "--session-dir",
     tmpSessionDir,
-    "--no-context-files",
+    "--fork",
+    sessionFile,
     "--tools",
-    "read,grep,find,ls",
+    "read,grep,find,ls,session_search,session_context",
     ...model,
     ...thinking,
     prompt,
@@ -874,7 +880,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
   const metaPath = join(dir, "job.json");
   await writeJson(metaPath, {
     requestId: request.id,
-    cloneId: requestId,
+    consultationId: requestId,
     target,
     from,
     body,
@@ -895,7 +901,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     stderrFd = openSync(stderrPath, "a");
     const child = spawn("pi", args, {
       cwd: await workingDirectoryForAgent(target),
-      env: { ...process.env, PI_AGENT_EPHEMERAL_CLONE: "1" },
+      env: { ...process.env, PI_AGENT_CONSULTATION_TARGET: target, PI_AGENT_CONSULTATION_ID: requestId },
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
     });
@@ -912,7 +918,7 @@ async function runAgentAskClone(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
     if (stdoutFd !== undefined) closeSync(stdoutFd);
     if (stderrFd !== undefined) closeSync(stderrFd);
     await writeFile(stderrPath, `${error}\n`);
-    ctx.ui.notify(`Failed to start ${target} clone ask: ${error}`, "warning");
+    ctx.ui.notify(`Failed to start ${target} consultation: ${error}`, "warning");
     return { request, artifactPath, status: "failed" as const };
   }
 }
@@ -1123,7 +1129,7 @@ async function notifyNewInboxMessages(pi: ExtensionAPI, name: string, ctx: Exten
 function startInboxNoticeLoop(pi: ExtensionAPI, name: string, ctx: ExtensionCommandContext) {
   if (inboxNoticeTimer) clearInterval(inboxNoticeTimer);
   inboxNoticeTimer = undefined;
-  if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
+  if (IS_EPHEMERAL_CLONE || IS_CONSULTATION || IS_REFLECTION) return;
   const tick = () => {
     notifyNewInboxMessages(pi, name, ctx).catch(() => undefined);
   };
@@ -1195,7 +1201,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     const name = await currentAgentFromContext(ctx);
     if (name) {
       try {
-        if (!IS_EPHEMERAL_CLONE && !IS_REFLECTION) await acquireLock(name, ctx);
+        if (!IS_EPHEMERAL_CLONE && !IS_CONSULTATION && !IS_REFLECTION) await acquireLock(name, ctx);
         if (!IS_REFLECTION) await chdirToAgentWorkingDirectory(name, ctx as any);
         await applyManifest(pi, name, ctx as any);
         if (!IS_REFLECTION) {
@@ -1247,7 +1253,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => reflectionGuard(event, ctx));
 
   pi.on("session_compact", async (_event, ctx) => {
-    if (IS_EPHEMERAL_CLONE || IS_REFLECTION) return;
+    if (IS_EPHEMERAL_CLONE || IS_CONSULTATION || IS_REFLECTION) return;
     const name = await currentAgentFromContext(ctx);
     if (!name) return;
     const manifest = await readManifest(name).catch(() => undefined);
@@ -1483,12 +1489,12 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
     ctx.ui.setStatus?.("agent-ask", `asking ${target}…`);
     pi.sendMessage({
       customType: "agent-ask-status",
-      content: `Asking ${target} via read-only clone…`,
+      content: `Asking ${target} via forked side session…`,
       display: true,
       details: { target, status: "started" },
     });
     try {
-      const started = await runAgentAskClone(pi, ctx, target, body);
+      const started = await runAgentAskConsultation(pi, ctx, target, body);
       const answer = await waitForAskAnswer(target, started.request, 180_000);
       ctx.ui.setStatus?.("agent-ask", undefined);
       if (!answer) {
@@ -1510,7 +1516,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("agent-ask", {
-    description: "Ask another agent via an ephemeral read-only clone",
+    description: "Ask another agent via a read-only forked side session",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => launchAgentAsk(args, ctx, "agent-ask"),
   });
@@ -1522,7 +1528,7 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-ask-recover", {
-    description: "Recover completed clone ask answers from retained consultation sessions",
+    description: "Recover completed ask answers from retained consultation sessions",
     getArgumentCompletions: async (prefix) => (await listAgentTargets()).filter((a) => a !== "pi" && a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx) => {
       const name = args.trim() ? sanitizeName(args.trim().split(/\s+/)[0]) : await currentAgentFromContext(ctx);
@@ -1586,17 +1592,17 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
   pi.registerTool({
     name: "agent_ask",
     label: "Agent Ask",
-    description: "Ask another persistent Pi agent via an ephemeral read-only clone and return its answer.",
-    promptSnippet: "Use agent_ask when you need an immediate answer from another named agent via a read-only clone.",
+    description: "Ask another persistent Pi agent via a read-only forked side session and return its answer.",
+    promptSnippet: "Use agent_ask when you need an immediate answer from another named agent via a read-only forked side session.",
     promptGuidelines: [
       "Use agent_ask for synchronous consultation with another named agent when the user asks you to ask/consult/get input from that agent.",
       "Use agent_send_message for durable notes that do not need an immediate answer.",
-      "Consultation runs in an ephemeral clone and does not mutate the target agent's main session.",
+      "Consultation runs in a read-only forked side session from the target agent's current persistent session and does not mutate the target agent's main session.",
       "Use agent_list first if you need to discover available agent names.",
     ],
     parameters: Type.Object({
       to: Type.String({ description: "Target persistent agent name." }),
-      question: Type.String({ description: "Question or task for the target agent clone." }),
+      question: Type.String({ description: "Question or task for the target agent side session." }),
       timeoutMs: Type.Optional(Type.Number({ description: "Maximum time to wait for an answer in milliseconds. Default 180000." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1604,10 +1610,10 @@ export default function agentWorkspaces(pi: ExtensionAPI) {
       const question = params.question.trim();
       if (!question) throw new Error("Question is required.");
       const timeoutMs = Math.max(1000, Math.min(params.timeoutMs ?? 180_000, 600_000));
-      const started = await runAgentAskClone(pi, ctx as any, to, question);
+      const started = await runAgentAskConsultation(pi, ctx as any, to, question);
       if (started.status === "failed") {
         return {
-          content: [{ type: "text", text: `Failed to start ${to} consultation clone. Artifact: ${started.artifactPath}` }],
+          content: [{ type: "text", text: `Failed to start ${to} consultation. Artifact: ${started.artifactPath}` }],
           details: started,
         };
       }
