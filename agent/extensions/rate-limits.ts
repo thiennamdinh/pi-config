@@ -64,6 +64,8 @@ function parseWindow(headers: Map<string, string>, prefix: string, kind: "primar
   const windowMinutes = parseNumber(getHeader(headers, `${prefix}-${kind}-window-minutes`));
   const resetAt = parseNumber(getHeader(headers, `${prefix}-${kind}-reset-at`));
   if (usedPercent === undefined && windowMinutes === undefined && resetAt === undefined) return undefined;
+  // Codex emits an all-zero secondary window when that quota tier is disabled.
+  if (windowMinutes === 0 && !resetAt) return undefined;
   return { usedPercent, windowMinutes, resetAt };
 }
 
@@ -191,13 +193,17 @@ function formatStore(store: Store) {
 function footerText(store: Store) {
   const codex = store.openai?.codex?.find((s) => s.limitId === "codex") ?? store.openai?.codex?.[0];
   if (!codex) return undefined;
-  const p = codex.primary?.usedPercent;
-  const s = codex.secondary?.usedPercent;
-  const primary = p === undefined ? "?" : `${Math.round(p)}%`;
-  const secondary = s === undefined ? "?" : `${Math.round(s)}%`;
+  const windows = [codex.primary, codex.secondary]
+    .filter((win): win is RateWindow => Boolean(win))
+    .map((win) => {
+      const used = win.usedPercent === undefined ? "?" : `${Math.round(win.usedPercent)}%`;
+      const duration = win.windowMinutes ? formatMinutes(win.windowMinutes) : "?";
+      return `${used}/${duration}`;
+    });
+  if (!windows.length) return undefined;
   const age = formatAge(codex.updatedAt);
   const stale = Date.now() - codex.updatedAt > 60 * 60_000 ? " stale" : "";
-  return `OpenAI ${primary}/${codex.primary?.windowMinutes ? formatMinutes(codex.primary.windowMinutes) : "?"} ${secondary}/${codex.secondary?.windowMinutes ? formatMinutes(codex.secondary.windowMinutes) : "?"} ${age}${stale}`;
+  return `OpenAI ${windows.join(" ")} ${age}${stale}`;
 }
 
 async function updateFooter(ctx: any, store?: Store) {
